@@ -342,7 +342,7 @@ impl HttpResponse {
     pub fn new(status: StatusCode) -> Self {
         Self {
             status,
-            headers: vec![("Server".to_string(), "veysrs/0.4.1".to_string())],
+            headers: vec![("Server".to_string(), "veysrs/0.5.0".to_string())],
             body_source: BodySource::Bytes(Vec::new()),
             close_connection: false,
         }

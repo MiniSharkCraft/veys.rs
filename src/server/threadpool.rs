@@ -4,6 +4,7 @@ use std::thread;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[allow(dead_code)]
 pub struct ThreadPool {
     workers: Vec<Worker>,
     sender: Option<mpsc::Sender<Job>>,
@@ -18,9 +19,17 @@ struct Worker {
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || loop {
-            let message = match receiver.lock() {
-                Ok(guard) => guard.recv(),
-                Err(_) => break,
+            // Lock only long enough to dequeue a job; release before executing.
+            // Previously the MutexGuard was held across the blocking recv(), which
+            // serialised all N workers to one: the other N-1 threads all blocked on
+            // receiver.lock() while a single worker sat in recv().
+            let message = {
+                let guard = match receiver.lock() {
+                    Ok(g) => g,
+                    Err(_) => break,
+                };
+                guard.recv()
+                // guard (MutexGuard) is dropped here, before executing the job.
             };
 
             match message {
@@ -43,6 +52,7 @@ impl Worker {
     }
 }
 
+#[allow(dead_code)]
 impl ThreadPool {
     pub fn new(size: usize) -> Result<ThreadPool, &'static str> {
         if size == 0 {

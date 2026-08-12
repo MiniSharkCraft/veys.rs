@@ -25,6 +25,11 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub max_requests_per_connection: usize,
     pub deny_hidden_files: bool,
+    pub http2_enabled: bool,
+    pub http2_max_concurrent_streams: usize,
+    pub http2_max_frame_size: u32,
+    pub http2_max_header_block_size: usize,
+    pub http2_initial_window_size: u32,
 }
 
 impl Default for ServerConfig {
@@ -47,6 +52,11 @@ impl Default for ServerConfig {
             max_connections: 1024,
             max_requests_per_connection: 100,
             deny_hidden_files: true,
+            http2_enabled: true,
+            http2_max_concurrent_streams: 100,
+            http2_max_frame_size: 16_384,
+            http2_max_header_block_size: 65_536,
+            http2_initial_window_size: 65_535,
         }
     }
 }

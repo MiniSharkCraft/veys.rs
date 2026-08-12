@@ -17,12 +17,12 @@ pub struct Server {
     config_manager: Arc<ConfigManager>,
 }
 
-pub struct ConnectionGuard<'a> {
-    counter: &'a AtomicUsize,
+pub struct ConnectionGuard {
+    counter: Arc<AtomicUsize>,
 }
 
-impl<'a> ConnectionGuard<'a> {
-    pub fn try_acquire(counter: &'a AtomicUsize, max: usize) -> Option<Self> {
+impl ConnectionGuard {
+    pub fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
         loop {
             let current = counter.load(Ordering::SeqCst);
             if current >= max {
@@ -32,13 +32,15 @@ impl<'a> ConnectionGuard<'a> {
                 .compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return Some(Self { counter });
+                return Some(Self {
+                    counter: Arc::clone(counter),
+                });
             }
         }
     }
 }
 
-impl<'a> Drop for ConnectionGuard<'a> {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::SeqCst);
     }
@@ -82,36 +84,50 @@ impl Server {
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, peer_addr)) => {
-                    let active_conn = Arc::clone(&active_connections);
-
-                    // Giới hạn kết nối đồng thời với ConnectionGuard RAII
-                    if active_conn.load(Ordering::SeqCst) >= self.config.max_connections {
-                        let resp = HttpResponse::new(StatusCode::ServiceUnavailable)
-                            .set_close_connection(true)
-                            .with_body(
-                                b"503 Service Unavailable: Maximum connection limit reached"
-                                    .to_vec(),
-                                "text/plain; charset=utf-8",
-                            );
-                        let _ = resp.send_to(&mut stream);
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-                        let mut dummy = [0u8; 512];
-                        let _ = stream.read(&mut dummy);
-                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    // Accepted sockets on Linux inherit O_NONBLOCK from the listener
+                    // (Rust std uses accept4(SOCK_NONBLOCK) internally).  All HTTP/1.1
+                    // and HTTP/2 I/O in this server uses blocking semantics: a read()
+                    // that returns WouldBlock prematurely terminates the connection.
+                    // For spec-compliant clients (e.g. curl) that pipeline preface +
+                    // SETTINGS + HEADERS as separate kernel writes, the server could
+                    // read the preface and then immediately get WouldBlock before the
+                    // HEADERS frame arrives — silently dropping the connection.  Under
+                    // h2load load this repeats thousands of times, starving the kernel
+                    // TCP stack and causing unrelated connections to experience multi-
+                    // second TTFB.  Make the accepted socket blocking right away.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        eprintln!("[ERROR] Failed to set stream to blocking: {}", e);
                         continue;
                     }
+
+                    let guard = match ConnectionGuard::try_acquire(
+                        &active_connections,
+                        self.config.max_connections,
+                    ) {
+                        Some(g) => g,
+                        None => {
+                            let resp = HttpResponse::new(StatusCode::ServiceUnavailable)
+                                .set_close_connection(true)
+                                .with_body(
+                                    b"503 Service Unavailable: Maximum connection limit reached"
+                                        .to_vec(),
+                                    "text/plain; charset=utf-8",
+                                );
+                            let _ = resp.send_to(&mut stream);
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                            let mut dummy = [0u8; 512];
+                            let _ = stream.read(&mut dummy);
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            continue;
+                        }
+                    };
 
                     let config = Arc::clone(&self.config);
                     let config_manager = Arc::clone(&self.config_manager);
 
-                    let job_res = pool.execute(move || {
-                        let _guard = match ConnectionGuard::try_acquire(
-                            &active_conn,
-                            config.max_connections,
-                        ) {
-                            Some(g) => g,
-                            None => return,
-                        };
+                    let _ = thread::spawn(move || {
+                        let _guard = guard;
 
                         let _ =
                             stream.set_read_timeout(Some(Duration::from_secs(config.read_timeout)));
@@ -119,6 +135,23 @@ impl Server {
                             .set_write_timeout(Some(Duration::from_secs(config.write_timeout)));
 
                         let handler = RequestHandler::new(&config, &config_manager);
+
+                        if config.http2_enabled {
+                            let mut peek_buf = [0u8; 24];
+                            let n = stream.peek(&mut peek_buf).unwrap_or(0);
+                            if n >= crate::server::http2::CLIENT_PREFACE.len()
+                                && &peek_buf[..crate::server::http2::CLIENT_PREFACE.len()]
+                                    == crate::server::http2::CLIENT_PREFACE
+                            {
+                                let mut h2 = crate::server::http2::Http2Connection::new(
+                                    &config,
+                                    &config_manager,
+                                );
+                                let _ = h2.handle_connection(&mut stream, &[], Some(peer_addr));
+                                return;
+                            }
+                        }
+
                         let mut conn_buf = Vec::new();
                         let mut request_count = 0;
 
@@ -190,10 +223,6 @@ impl Server {
                             }
                         }
                     });
-
-                    if let Err(e) = job_res {
-                        eprintln!("[WARN] Failed to dispatch connection: {}", e);
-                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(1));
@@ -232,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_connection_limit_guard() {
-        let counter = AtomicUsize::new(0);
+        let counter = Arc::new(AtomicUsize::new(0));
         let g1 = ConnectionGuard::try_acquire(&counter, 2);
         assert!(g1.is_some());
         let g2 = ConnectionGuard::try_acquire(&counter, 2);

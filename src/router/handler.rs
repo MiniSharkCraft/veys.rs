@@ -601,6 +601,96 @@ mod tests {
     }
 
     #[test]
+    fn test_h2_conditional_requests_and_header_case_variations() {
+        let config = ServerConfig::default();
+        let config_manager = ConfigManager::new();
+        let handler = RequestHandler::new(&config, &config_manager);
+
+        let initial_req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/2.0".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let initial_resp = handler.handle_request(&initial_req, None);
+        assert_eq!(initial_resp.status, StatusCode::Ok);
+        let etag = initial_resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("ETag"))
+            .map(|(_, v)| v.clone())
+            .expect("ETag header present");
+
+        // 1. HTTP/2 request containing If-None-Match matching resource ETag -> 304
+        let match_req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/2.0".to_string(),
+            headers: vec![("if-none-match".to_string(), etag.clone())],
+            body: Vec::new(),
+        };
+        let match_resp = handler.handle_request(&match_req, None);
+        assert_eq!(match_resp.status, StatusCode::NotModified);
+
+        // 2. Non-matching If-None-Match -> 200
+        let non_match_req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/2.0".to_string(),
+            headers: vec![("if-none-match".to_string(), "\"invalid-etag\"".to_string())],
+            body: Vec::new(),
+        };
+        let non_match_resp = handler.handle_request(&non_match_req, None);
+        assert_eq!(non_match_resp.status, StatusCode::Ok);
+
+        // 3. Header-name case variations behave identically
+        for header_name in &[
+            "if-none-match",
+            "If-None-Match",
+            "IF-NONE-MATCH",
+            "iF-nOnE-mAtCh",
+        ] {
+            let req = HttpRequest {
+                method: Method::Get,
+                uri: "/".to_string(),
+                version: "HTTP/2.0".to_string(),
+                headers: vec![(header_name.to_string(), etag.clone())],
+                body: Vec::new(),
+            };
+            let resp = handler.handle_request(&req, None);
+            assert_eq!(
+                resp.status,
+                StatusCode::NotModified,
+                "Failed for case variation {}",
+                header_name
+            );
+        }
+
+        // 4. Range produces 206
+        let range_req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/2.0".to_string(),
+            headers: vec![("range".to_string(), "bytes=0-10".to_string())],
+            body: Vec::new(),
+        };
+        let range_resp = handler.handle_request(&range_req, None);
+        assert_eq!(range_resp.status, StatusCode::PartialContent);
+
+        // 5. Existing HTTP/1.1 conditional request tests remain passing
+        let h1_req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("If-None-Match".to_string(), etag)],
+            body: Vec::new(),
+        };
+        let h1_resp = handler.handle_request(&h1_req, None);
+        assert_eq!(h1_resp.status, StatusCode::NotModified);
+    }
+
+    #[test]
     fn test_expanded_mime_types() {
         assert_eq!(
             get_mime_type(Path::new("page.html")),
