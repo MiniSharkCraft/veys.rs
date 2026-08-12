@@ -26,7 +26,7 @@ impl Worker {
             match message {
                 Ok(job) => {
                     let result = catch_unwind(AssertUnwindSafe(job));
-                    if let Err(_) = result {
+                    if result.is_err() {
                         eprintln!("[ERROR] ThreadPool worker {} caught job panic", id);
                     }
                 }

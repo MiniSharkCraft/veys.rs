@@ -6,12 +6,12 @@
 
 [![Rust Edition](https://img.shields.io/badge/Rust-2021-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
 [![HTTP Protocol](https://img.shields.io/badge/HTTP-1.1-blue?style=for-the-badge)](https://tools.ietf.org/html/rfc2616)
-[![Version](https://img.shields.io/badge/version-0.3.0-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-19%2F19%20passing-success?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs)
+[![Version](https://img.shields.io/badge/version-0.4.0-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
+[![Tests](https://img.shields.io/badge/tests-22%2F22%20passing-success?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs)
 
 ---
 
-> *Small footprint. Bounded memory resources. Hardened request handling.*
+> *Small footprint. Bounded memory resources. Hardened request handling & Range Requests.*
 
 </div>
 
@@ -19,7 +19,7 @@
 
 **veysrs** (Vey Server.rs) is a lightweight HTTP/1.1 static web server built from scratch using pure **Rust Standard Library (`std`)** with **zero external dependencies**.
 
-Designed for predictable memory usage, high reliability, and clear execution flow, `veysrs` employs a synchronous blocking TCP I/O architecture paired with a fixed worker thread pool (`ThreadPool`), per-directory `.veysrule` configuration inheritance, and comprehensive request limits.
+Designed for predictable memory usage, high reliability, and clear execution flow, `veysrs` employs a synchronous blocking TCP I/O architecture paired with a fixed worker thread pool (`ThreadPool`), per-directory `.veysrule` configuration inheritance, ETags, conditional requests (`304 Not Modified`), and HTTP Range Requests (`206 Partial Content`).
 
 > [!NOTE]
 > `veysrs` is built strictly with Rust `std` without high-level web frameworks (Axum, Actix-web, Hyper, Warp) or async runtimes (Tokio).
@@ -33,7 +33,9 @@ Designed for predictable memory usage, high reliability, and clear execution flo
 | 🌐 **HTTP/1.1 Parsing** | Strict HTTP/1.1 request line and header validation | ✅ |
 | 🧵 **Thread Pool** | Synchronous worker thread pool with worker panic isolation | ✅ |
 | 📁 **Static Serving** | MIME-type auto-detection and static asset delivery | ✅ |
-| ⚡ **Bounded Streaming** | Fixed 64KB stack buffer streaming for large files (zero full-body heap allocation) | ✅ |
+| 🏷️ **ETags & Conditional** | Automatic ETag, Last-Modified, `If-None-Match`, `If-Modified-Since` → `304 Not Modified` | ✅ |
+| ✂️ **Range Requests** | HTTP byte Range Requests (`206 Partial Content` & `416 Range Not Satisfiable`) | ✅ |
+| ⚡ **Bounded Streaming** | Fixed 64KB stack buffer streaming for full & range file requests | ✅ |
 | 🔒 **Path Security** | Protection against canonical path traversal and symlink escapes | ✅ |
 | 🕵️ **Hidden File Blocking** | Restricted access to dotfiles (`.veysrule`, `.env`, `.git`) | ✅ |
 | ⏱️ **Socket Timeouts** | Independent read, write, and keep-alive socket idle timeouts | ✅ |
@@ -47,7 +49,7 @@ Designed for predictable memory usage, high reliability, and clear execution flo
 
 ## 🛡️ Security & Hardening
 
-`veysrs` v0.3.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities and bad actors:
+`veysrs` v0.4.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities:
 
 - **Path Traversal Protection**: Double percent-decoding defense (`%252e%252e` → `%2e%2e` → `..`) combined with `fs::canonicalize()` validation against `ROOT_DIR`.
 - **Symlink Escape Protection**: Verifies that canonical file target paths remain strictly inside `canonical_root`.
@@ -79,8 +81,9 @@ Designed for predictable memory usage, high reliability, and clear execution flo
 git clone <repository-url>
 cd veysrs
 
-# Check format & test
-cargo check
+# Check format, lints & test
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 
 # Build optimized release binary
@@ -93,14 +96,14 @@ cargo build --release
 ### Verification
 
 ```bash
-# Fetch root index page
+# Fetch root index page (returns 200 OK + ETag + Last-Modified)
 curl -i http://127.0.0.1:8989/
 
-# Inspect HEAD metadata (zero body read)
-curl -fsSI http://127.0.0.1:8989/index.html
+# Test Conditional 304 Not Modified
+curl -i -H 'If-None-Match: "<etag-from-above>"' http://127.0.0.1:8989/
 
-# Verify .veysrule file protection (403 Forbidden)
-curl -i http://127.0.0.1:8989/.veysrule
+# Test Range Request (206 Partial Content)
+curl -i -H 'Range: bytes=0-49' http://127.0.0.1:8989/
 ```
 
 ---
@@ -129,29 +132,11 @@ curl -i http://127.0.0.1:8989/.veysrule
 | `ADD_HEADER` | Directory | Append custom HTTP response header (`Header: Value`) | None |
 | `REDIRECT_404` | Directory | Custom 404 error page path | None |
 
-### Sample `.veysrule`
-
-```ini
-# Global Server Resource Limits
-WORKERS = 4
-MAX_CONNECTIONS = 1024
-MAX_REQUESTS_PER_CONNECTION = 100
-READ_TIMEOUT = 10
-WRITE_TIMEOUT = 10
-KEEP_ALIVE_TIMEOUT = 10
-
-# Directory Directives
-DENY_HIDDEN_FILES = true
-ADD_HEADER = X-Powered-By: veysrs
-ADD_HEADER = X-Frame-Options: SAMEORIGIN
-REDIRECT_404 = 404.html
-```
-
 ---
 
 ## 🖥️ CLI Usage
 
-`veysrs` provides flexible command-line flags to override default configurations:
+`veysrs` provides flexible command-line flags:
 
 ```text
 USAGE:
@@ -181,17 +166,18 @@ veysrs/
 ├── Cargo.lock                 # Lockfile
 ├── README.md                  # Project documentation
 ├── docs/
-│   └── v0.3-hardening.md      # v0.3.0 hardening specification
+│   ├── v0.3-hardening.md      # v0.3.0 hardening specification
+│   └── v0.4-hardening.md      # v0.4.0 technical specification
 ├── public/
 │   └── index.html             # Default static web asset
 ├── release/
-│   └── veysrs-v0.3.0.tar.gz   # Clean release archive
+│   └── veysrs-v0.3.0.tar.gz   # Release archive
 └── src/
     ├── main.rs                # Entrypoint & CLI parser
     ├── config/                # .veysrule parser & inheritance manager
     │   ├── mod.rs
     │   └── veysrule.rs
-    ├── router/                # Request handler, path normalization & security
+    ├── router/                # Request handler, ETags, 304, 206 Range & security
     │   ├── mod.rs
     │   └── handler.rs
     └── server/                # TCP listener, HTTP/1.1 parser & ThreadPool
@@ -205,71 +191,36 @@ veysrs/
 
 ## 🧪 Testing
 
-The codebase includes unit tests covering configuration parsing, HTTP request/header validation, limit enforcement, threadpool panic isolation, and connection guards.
-
 ```bash
 # Run format check
 cargo fmt --check
 
-# Run static analysis
-cargo check
+# Run clippy lints
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Run unit test suite
 cargo test
 ```
 
 > [!TIP]
-> All 19 unit tests pass cleanly out of the box (`19/19 passing`).
-
----
-
-## 📦 Release
-
-Clean release archives are generated without build artifacts or temporary test files:
-
-- **Archive Location**: `release/veysrs-v0.3.0.tar.gz`
-
-### Building from Source Archive
-
-```bash
-# Extract release archive
-tar -xzf release/veysrs-v0.3.0.tar.gz
-cd veysrs-v0.3.0
-
-# Build release binary
-cargo build --release
-
-# Run production binary
-./target/release/veysrs --port 8080
-```
+> All 22 unit tests pass cleanly out of the box (`22/22 passing`).
 
 ---
 
 ## ⚠️ Current Limitations
 
-- **No Native TLS/HTTPS**: Standard HTTP/1.1 only (use reverse proxies such as Nginx/Caddy for SSL termination).
+- **HTTP/2 and HTTP/3 Unimplemented**: v0.4.0 strictly focuses on HTTP/1.1. HTTP/2 is planned for v0.5+ and HTTP/3 + QUIC for v1.0+.
+- **No Native TLS/HTTPS**: Standard HTTP/1.1 plaintext only (use reverse proxies like Nginx/Caddy for SSL termination).
 - **Chunked Transfer-Encoding Unimplemented**: `Transfer-Encoding: chunked` requests return `501 Not Implemented`.
-- **Static Assets Only**: Dynamic application execution (CGI/FastCGI/WSGI) is not supported by design.
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] HTTPS / TLS support via standard library hooks or minimal crypto wrappers.
-- [ ] HTTP Range requests (`206 Partial Content`) for media seeking.
-- [ ] Enhanced access logging formats (Combined Log Format / JSON struct logs).
-- [ ] Automated integration test runner script.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these simple steps:
-
-1. Fork the repository.
-2. Create a topic branch (`git checkout -b feature/amazing-feature`).
-3. Ensure all tests pass (`cargo test`).
-4. Open a Pull Request with a clear summary of your changes.
+- [ ] HTTP/2 support (planned for v0.5+).
+- [ ] HTTP/3 + QUIC support (planned for v1.0+).
+- [ ] HTTPS / TLS support.
+- [ ] Enhanced access logging formats (JSON struct logs).
 
 ---
 

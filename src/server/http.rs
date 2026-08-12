@@ -38,6 +38,8 @@ impl From<&str> for Method {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StatusCode {
     Ok = 200,
+    PartialContent = 206,
+    NotModified = 304,
     BadRequest = 400,
     Forbidden = 403,
     NotFound = 404,
@@ -45,6 +47,7 @@ pub enum StatusCode {
     RequestTimeout = 408,
     PayloadTooLarge = 413,
     UriTooLong = 414,
+    RangeNotSatisfiable = 416,
     RequestHeaderFieldsTooLarge = 431,
     InternalServerError = 500,
     NotImplemented = 501,
@@ -60,6 +63,8 @@ impl StatusCode {
     pub fn reason_phrase(&self) -> &'static str {
         match self {
             StatusCode::Ok => "OK",
+            StatusCode::PartialContent => "Partial Content",
+            StatusCode::NotModified => "Not Modified",
             StatusCode::BadRequest => "Bad Request",
             StatusCode::Forbidden => "Forbidden",
             StatusCode::NotFound => "Not Found",
@@ -67,6 +72,7 @@ impl StatusCode {
             StatusCode::RequestTimeout => "Request Timeout",
             StatusCode::PayloadTooLarge => "Payload Too Large",
             StatusCode::UriTooLong => "URI Too Long",
+            StatusCode::RangeNotSatisfiable => "Range Not Satisfiable",
             StatusCode::RequestHeaderFieldsTooLarge => "Request Header Fields Too Large",
             StatusCode::InternalServerError => "Internal Server Error",
             StatusCode::NotImplemented => "Not Implemented",
@@ -315,6 +321,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub enum BodySource {
     Bytes(Vec<u8>),
     File(PathBuf, u64),
+    FileRange(PathBuf, u64, u64),
 }
 
 impl Default for BodySource {
@@ -335,7 +342,7 @@ impl HttpResponse {
     pub fn new(status: StatusCode) -> Self {
         Self {
             status,
-            headers: vec![("Server".to_string(), "veysrs/0.3.0".to_string())],
+            headers: vec![("Server".to_string(), "veysrs/0.4.0".to_string())],
             body_source: BodySource::Bytes(Vec::new()),
             close_connection: false,
         }
@@ -366,6 +373,21 @@ impl HttpResponse {
         self
     }
 
+    pub fn with_file_range(
+        mut self,
+        path: PathBuf,
+        offset: u64,
+        length: u64,
+        content_type: &str,
+    ) -> Self {
+        self.headers
+            .push(("Content-Length".to_string(), length.to_string()));
+        self.headers
+            .push(("Content-Type".to_string(), content_type.to_string()));
+        self.body_source = BodySource::FileRange(path, offset, length);
+        self
+    }
+
     pub fn set_close_connection(mut self, close: bool) -> Self {
         self.close_connection = close;
         self
@@ -375,6 +397,7 @@ impl HttpResponse {
         match &self.body_source {
             BodySource::Bytes(b) => b.len(),
             BodySource::File(_, sz) => *sz as usize,
+            BodySource::FileRange(_, _, len) => *len as usize,
         }
     }
 
@@ -423,6 +446,26 @@ impl HttpResponse {
                             break;
                         }
                         stream.write_all(&chunk[..n])?;
+                    }
+                }
+            }
+            BodySource::FileRange(path, offset, length) => {
+                if let Ok(mut file) = std::fs::File::open(path) {
+                    use std::io::Seek;
+                    if file.seek(std::io::SeekFrom::Start(*offset)).is_ok() {
+                        let mut remaining = *length;
+                        let mut chunk = [0u8; 65536];
+                        while remaining > 0 {
+                            let to_read = (remaining.min(chunk.len() as u64)) as usize;
+                            match file.read(&mut chunk[..to_read]) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    stream.write_all(&chunk[..n])?;
+                                    remaining -= n as u64;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
             }
@@ -479,8 +522,10 @@ mod tests {
 
     #[test]
     fn test_uri_length_limit() {
-        let mut cfg = ServerConfig::default();
-        cfg.max_uri_length = 10;
+        let cfg = ServerConfig {
+            max_uri_length: 10,
+            ..ServerConfig::default()
+        };
         let mut buf = b"GET /12345678901 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
         let err = parse_http_request_from_buf_with_limits(&mut buf, &cfg).unwrap_err();
         assert_eq!(err, HttpParseError::OversizedRequestLine);
@@ -488,8 +533,10 @@ mod tests {
 
     #[test]
     fn test_request_size_limit() {
-        let mut cfg = ServerConfig::default();
-        cfg.max_request_size = 5;
+        let cfg = ServerConfig {
+            max_request_size: 5,
+            ..ServerConfig::default()
+        };
         let mut buf =
             b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\n1234567890".to_vec();
         let err = parse_http_request_from_buf_with_limits(&mut buf, &cfg).unwrap_err();
@@ -498,8 +545,10 @@ mod tests {
 
     #[test]
     fn test_header_count_limit() {
-        let mut cfg = ServerConfig::default();
-        cfg.max_headers = 2;
+        let cfg = ServerConfig {
+            max_headers: 2,
+            ..ServerConfig::default()
+        };
         let mut buf = b"GET / HTTP/1.1\r\nHost: localhost\r\nX-H1: 1\r\nX-H2: 2\r\n\r\n".to_vec();
         let err = parse_http_request_from_buf_with_limits(&mut buf, &cfg).unwrap_err();
         assert_eq!(err, HttpParseError::TooManyHeaders);

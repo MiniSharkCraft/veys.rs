@@ -66,8 +66,7 @@ impl Server {
             self.config.dev_mode
         );
 
-        let pool = ThreadPool::new(self.config.workers)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let pool = ThreadPool::new(self.config.workers).map_err(std::io::Error::other)?;
 
         let active_connections = Arc::new(AtomicUsize::new(0));
         let running = Arc::new(AtomicBool::new(true));

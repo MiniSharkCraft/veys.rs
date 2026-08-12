@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use crate::config::{ConfigManager, ServerConfig};
 use crate::server::http::{HttpRequest, HttpResponse, Method, StatusCode};
@@ -150,20 +150,81 @@ impl<'a> RequestHandler<'a> {
 
         let mut resp = match File::open(&canonical_file) {
             Ok(file) => {
-                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let metadata = file.metadata().ok();
+                let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let mtime = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let mtime_secs = mtime
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
 
-                if req.method == Method::Head {
-                    // HEAD Method: Chỉ đọc Metadata, không đọc toàn bộ nội dung file vào memory
+                let etag = generate_etag(mtime_secs, file_size);
+                let last_modified = format_http_date(mtime);
+
+                // Conditional Request Evaluation: If-None-Match & If-Modified-Since
+                let mut is_not_modified = false;
+                if let Some(if_none_match) = req.get_header("If-None-Match") {
+                    let client_etag = if_none_match.trim();
+                    if client_etag == "*" || client_etag == etag || client_etag.contains(&etag) {
+                        is_not_modified = true;
+                    }
+                } else if let Some(if_modified_since) = req.get_header("If-Modified-Since") {
+                    if let Some(parsed_time) = parse_http_date(if_modified_since.trim()) {
+                        if mtime_secs <= parsed_time {
+                            is_not_modified = true;
+                        }
+                    }
+                }
+
+                if is_not_modified {
+                    HttpResponse::new(StatusCode::NotModified)
+                        .with_header("ETag", &etag)
+                        .with_header("Last-Modified", &last_modified)
+                } else if req.method == Method::Get && req.get_header("Range").is_some() {
+                    let range_str = req.get_header("Range").unwrap().trim();
+                    match parse_range_header(range_str, file_size) {
+                        Ok(Some(range)) => {
+                            let length = range.end - range.start + 1;
+                            let content_range =
+                                format!("bytes {}-{}/{}", range.start, range.end, file_size);
+                            HttpResponse::new(StatusCode::PartialContent)
+                                .with_header("ETag", &etag)
+                                .with_header("Last-Modified", &last_modified)
+                                .with_header("Content-Range", &content_range)
+                                .with_header("Accept-Ranges", "bytes")
+                                .with_file_range(canonical_file, range.start, length, mime_type)
+                        }
+                        Err(_) => {
+                            let content_range = format!("bytes */{}", file_size);
+                            HttpResponse::new(StatusCode::RangeNotSatisfiable)
+                                .with_header("Content-Range", &content_range)
+                                .with_body(
+                                    b"416 Range Not Satisfiable".to_vec(),
+                                    "text/plain; charset=utf-8",
+                                )
+                        }
+                        Ok(None) => HttpResponse::new(StatusCode::Ok)
+                            .with_header("ETag", &etag)
+                            .with_header("Last-Modified", &last_modified)
+                            .with_header("Accept-Ranges", "bytes")
+                            .with_file(canonical_file, file_size, mime_type),
+                    }
+                } else if req.method == Method::Head {
                     HttpResponse::new(StatusCode::Ok)
                         .with_header("Content-Length", &file_size.to_string())
                         .with_header("Content-Type", mime_type)
+                        .with_header("ETag", &etag)
+                        .with_header("Last-Modified", &last_modified)
+                        .with_header("Accept-Ranges", "bytes")
                 } else {
-                    // Bounded-Memory Stream I/O: Truyền PathBuf + file_size để send_to stream trực tiếp
-                    HttpResponse::new(StatusCode::Ok).with_file(
-                        canonical_file,
-                        file_size,
-                        mime_type,
-                    )
+                    HttpResponse::new(StatusCode::Ok)
+                        .with_header("ETag", &etag)
+                        .with_header("Last-Modified", &last_modified)
+                        .with_header("Accept-Ranges", "bytes")
+                        .with_file(canonical_file, file_size, mime_type)
                 }
             }
             Err(_) => self.handle_404(&merged_config),
@@ -223,6 +284,163 @@ fn apply_custom_headers(mut resp: HttpResponse, headers: &[(String, String)]) ->
         resp = resp.with_header(name, val);
     }
     resp
+}
+
+pub fn generate_etag(mtime_secs: u64, file_size: u64) -> String {
+    format!("\"{:x}-{:x}\"", mtime_secs, file_size)
+}
+
+pub fn format_http_date(st: SystemTime) -> String {
+    let dur = st
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+
+    let days_since_epoch = secs / 86400;
+    let secs_of_day = secs % 86400;
+
+    let hours = secs_of_day / 3600;
+    let minutes = (secs_of_day % 3600) / 60;
+    let seconds = secs_of_day % 60;
+
+    let wday_idx = ((days_since_epoch + 4) % 7) as usize;
+    let wdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+    let mut l = days_since_epoch + 68569 + 2440588;
+    let n = (4 * l) / 146097;
+    l -= (146097 * n).div_ceil(4);
+    let i = (4000 * (l + 1)) / 1461001;
+    l = l - (1461 * i) / 4 + 31;
+    let j = (80 * l) / 2447;
+    let day = l - (2447 * j) / 80;
+    l = j / 11;
+    let month = j + 2 - 12 * l;
+    let year = 100 * (n - 49) + i + l;
+
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        wdays[wday_idx],
+        day,
+        months[(month - 1) as usize],
+        year,
+        hours,
+        minutes,
+        seconds
+    )
+}
+
+pub fn parse_http_date(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+
+    let (day_str, month_str, year_str, time_str) = if parts.len() == 6 {
+        (parts[1], parts[2], parts[3], parts[4])
+    } else {
+        (parts[0], parts[1], parts[2], parts[3])
+    };
+
+    let day: u64 = day_str.trim_matches(',').parse().ok()?;
+    let year: u64 = year_str.parse().ok()?;
+
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month_idx = months
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(month_str))? as u64
+        + 1;
+
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let min: u64 = time_parts[1].parse().ok()?;
+    let sec: u64 = time_parts[2].parse().ok()?;
+
+    // Simple Julian Day Number calculation to Unix Timestamp
+    let a = (14 - month_idx) / 12;
+    let y = year + 4800 - a;
+    let m = month_idx + 12 * a - 3;
+    let jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+
+    if jdn < 2440588 {
+        return None;
+    }
+
+    let days = jdn - 2440588;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangeSpec {
+    pub start: u64,
+    pub end: u64,
+}
+
+pub fn parse_range_header(header: &str, file_size: u64) -> Result<Option<RangeSpec>, ()> {
+    if !header.starts_with("bytes=") {
+        return Ok(None);
+    }
+
+    if file_size == 0 {
+        return Err(());
+    }
+
+    let spec = header["bytes=".len()..].trim();
+    if spec.contains(',') {
+        return Ok(None); // Multiple ranges not supported, fall back to full file
+    }
+
+    let parts: Vec<&str> = spec.split('-').collect();
+    if parts.len() != 2 {
+        return Ok(None);
+    }
+
+    let (start_str, end_str) = (parts[0].trim(), parts[1].trim());
+
+    if start_str.is_empty() && end_str.is_empty() {
+        return Ok(None);
+    }
+
+    if start_str.is_empty() {
+        // bytes=-suffix
+        let suffix_len: u64 = end_str.parse().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = file_size.saturating_sub(suffix_len);
+        Ok(Some(RangeSpec {
+            start,
+            end: file_size - 1,
+        }))
+    } else if end_str.is_empty() {
+        // bytes=start-
+        let start: u64 = start_str.parse().map_err(|_| ())?;
+        if start >= file_size {
+            return Err(());
+        }
+        Ok(Some(RangeSpec {
+            start,
+            end: file_size - 1,
+        }))
+    } else {
+        // bytes=start-end
+        let start: u64 = start_str.parse().map_err(|_| ())?;
+        let end: u64 = end_str.parse().map_err(|_| ())?;
+        if start >= file_size || start > end {
+            return Err(());
+        }
+        let end = end.min(file_size - 1);
+        Ok(Some(RangeSpec { start, end }))
+    }
 }
 
 pub fn percent_decode_recursive(input: &str) -> Option<String> {
@@ -314,6 +532,51 @@ pub fn get_mime_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_etag_generation() {
+        let etag = generate_etag(1700000000, 1024);
+        assert_eq!(etag, "\"6553f100-400\"");
+    }
+
+    #[test]
+    fn test_http_date_format_and_parse() {
+        let st = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
+        let formatted = format_http_date(st);
+        let parsed = parse_http_date(&formatted).unwrap();
+        assert_eq!(parsed, 1700000000);
+    }
+
+    #[test]
+    fn test_parse_range_header() {
+        // bytes=0-499
+        let r1 = parse_range_header("bytes=0-499", 1000).unwrap().unwrap();
+        assert_eq!(r1, RangeSpec { start: 0, end: 499 });
+
+        // bytes=500-
+        let r2 = parse_range_header("bytes=500-", 1000).unwrap().unwrap();
+        assert_eq!(
+            r2,
+            RangeSpec {
+                start: 500,
+                end: 999
+            }
+        );
+
+        // bytes=-200
+        let r3 = parse_range_header("bytes=-200", 1000).unwrap().unwrap();
+        assert_eq!(
+            r3,
+            RangeSpec {
+                start: 800,
+                end: 999
+            }
+        );
+
+        // Unsatisfiable Range
+        assert!(parse_range_header("bytes=1500-2000", 1000).is_err());
+        assert!(parse_range_header("bytes=500-400", 1000).is_err());
+    }
 
     #[test]
     fn test_double_percent_decode() {

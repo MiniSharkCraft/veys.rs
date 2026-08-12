@@ -52,23 +52,12 @@ impl Default for ServerConfig {
 }
 
 /// Cấu hình cấp thư mục được quy định bởi file `.veysrule`
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DirectoryConfig {
     pub deny_ips: Vec<IpAddr>,
     pub headers: Vec<(String, String)>,
     pub redirect_404: Option<String>,
     pub deny_hidden_files: Option<bool>,
-}
-
-impl Default for DirectoryConfig {
-    fn default() -> Self {
-        Self {
-            deny_ips: Vec::new(),
-            headers: Vec::new(),
-            redirect_404: None,
-            deny_hidden_files: None,
-        }
-    }
 }
 
 impl DirectoryConfig {
@@ -576,7 +565,7 @@ REDIRECT_404 = /404.html
         assert_eq!(server_cfg.port, 8080);
         assert_eq!(server_cfg.max_request_size, 131072);
         assert_eq!(server_cfg.max_connections, 2048);
-        assert_eq!(server_cfg.deny_hidden_files, true);
+        assert!(server_cfg.deny_hidden_files);
         assert_eq!(dir_cfg.deny_ips.len(), 1);
         assert_eq!(
             dir_cfg.headers,
