@@ -140,6 +140,10 @@ impl Server {
                                     if is_last_request {
                                         break;
                                     }
+
+                                    let _ = stream.set_read_timeout(Some(Duration::from_secs(
+                                        config.keep_alive_timeout,
+                                    )));
                                 }
                                 Ok(None) => {
                                     let mut temp_buf = [0u8; 1024];
@@ -192,7 +196,7 @@ impl Server {
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) => {
                     eprintln!("[ERROR] Accept connection error: {}", e);

@@ -6,7 +6,7 @@
 
 [![Rust Edition](https://img.shields.io/badge/Rust-2021-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
 [![HTTP Protocol](https://img.shields.io/badge/HTTP-1.1-blue?style=for-the-badge)](https://tools.ietf.org/html/rfc2616)
-[![Version](https://img.shields.io/badge/version-0.4.0-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.4.1-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
 [![Tests](https://img.shields.io/badge/tests-22%2F22%20passing-success?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs)
 
 ---
