@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset_name: veys-server-linux-x86_64
+            use_cross: false
+
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            asset_name: veys-server-linux-aarch64
+            use_cross: true
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_name: veys-server-linux-musl-x86_64
+            use_cross: false
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_name: veys-server-linux-musl-aarch64
+            use_cross: true
+
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset_name: veys-server-windows-x86_64.exe
+            use_cross: false
+
+          - target: x86_64-apple-darwin
+            os: macos-13
+            asset_name: veys-server-macos-x86_64
+            use_cross: false
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_name: veys-server-macos-aarch64
+            use_cross: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux musl x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Cross
+        if: matrix.use_cross == true
+        uses: taiki-e/install-action@cross
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build binary (native)
+        if: matrix.use_cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build binary (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare asset (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cp "target/${{ matrix.target }}/release/veysrs" "${{ matrix.asset_name }}"
+          if command -v strip >/dev/null 2>&1; then
+            strip "${{ matrix.asset_name }}" || true
+          fi
+
+      - name: Prepare asset (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/veysrs.exe" "${{ matrix.asset_name }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Organize release assets & generate SHA-256 checksums
+        run: |
+          mkdir -p release_assets
+          cd artifacts
+          find . -type f | while read -r file; do
+            filename=$(basename "$file")
+            cp "$file" "../release_assets/$filename"
+          done
+          cd ../release_assets
+          sha256sum * > checksums-sha256.txt
+          echo "=== RELEASE ASSETS ==="
+          ls -lh
+          echo "=== SHA-256 CHECKSUMS ==="
+          cat checksums-sha256.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          name: Vey Server ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
