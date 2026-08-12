@@ -1,0 +1,9 @@
+target/
+release/veysrs-v0.3.0/
+*.tmp
+*.log
+*.bin
+.DS_Store
+.env
+.env.*
+!.veysrule

@@ -1,0 +1,278 @@
+<div align="center">
+
+# 🚀 veysrs
+
+**Lightweight, Multithreaded HTTP/1.1 Static Web Server written in Pure Rust**
+
+[![Rust Edition](https://img.shields.io/badge/Rust-2021-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
+[![HTTP Protocol](https://img.shields.io/badge/HTTP-1.1-blue?style=for-the-badge)](https://tools.ietf.org/html/rfc2616)
+[![Version](https://img.shields.io/badge/version-0.3.0-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
+[![Tests](https://img.shields.io/badge/tests-19%2F19%20passing-success?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs)
+
+---
+
+> *Small footprint. Bounded memory resources. Hardened request handling.*
+
+</div>
+
+## 📖 Introduction
+
+**veysrs** (Vey Server.rs) is a lightweight HTTP/1.1 static web server built from scratch using pure **Rust Standard Library (`std`)** with **zero external dependencies**.
+
+Designed for predictable memory usage, high reliability, and clear execution flow, `veysrs` employs a synchronous blocking TCP I/O architecture paired with a fixed worker thread pool (`ThreadPool`), per-directory `.veysrule` configuration inheritance, and comprehensive request limits.
+
+> [!NOTE]
+> `veysrs` is built strictly with Rust `std` without high-level web frameworks (Axum, Actix-web, Hyper, Warp) or async runtimes (Tokio).
+
+---
+
+## ✨ Features
+
+| Feature | Description | Status |
+|:---|:---|:---:|
+| 🌐 **HTTP/1.1 Parsing** | Strict HTTP/1.1 request line and header validation | ✅ |
+| 🧵 **Thread Pool** | Synchronous worker thread pool with worker panic isolation | ✅ |
+| 📁 **Static Serving** | MIME-type auto-detection and static asset delivery | ✅ |
+| ⚡ **Bounded Streaming** | Fixed 64KB stack buffer streaming for large files (zero full-body heap allocation) | ✅ |
+| 🔒 **Path Security** | Protection against canonical path traversal and symlink escapes | ✅ |
+| 🕵️ **Hidden File Blocking** | Restricted access to dotfiles (`.veysrule`, `.env`, `.git`) | ✅ |
+| ⏱️ **Socket Timeouts** | Independent read, write, and keep-alive socket idle timeouts | ✅ |
+| 🚦 **Connection Limiting** | Atomic connection guard with HTTP 503 fallback | ✅ |
+| 🛡️ **Resource Limits** | Configurable bounds on URI, headers, line size, and payload body | ✅ |
+| 🔄 **Keep-Alive Pipelining** | Persistent HTTP/1.1 TCP connections with per-connection request counts | ✅ |
+| 📴 **Graceful Shutdown** | Safe SIGINT handling with channel closure and thread joining | ✅ |
+| ⚙️ **`.veysrule` System** | Hierarchical per-directory configuration inheritance | ✅ |
+
+---
+
+## 🛡️ Security & Hardening
+
+`veysrs` v0.3.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities and bad actors:
+
+- **Path Traversal Protection**: Double percent-decoding defense (`%252e%252e` → `%2e%2e` → `..`) combined with `fs::canonicalize()` validation against `ROOT_DIR`.
+- **Symlink Escape Protection**: Verifies that canonical file target paths remain strictly inside `canonical_root`.
+- **Dotfile Protection**: Automatically blocks requests containing hidden file components (e.g. `/.veysrule`, `/.env`, `/.git/config`) when `DENY_HIDDEN_FILES` is enabled.
+- **Resource Boundary Limits**:
+  - `MAX_URI_LENGTH`: 8,192 bytes (returns `414 URI Too Long`).
+  - `MAX_HEADER_LINE`: 8,192 bytes (returns `431 Request Header Fields Too Large`).
+  - `MAX_HEADERS`: 64 headers maximum (returns `431 Request Header Fields Too Large`).
+  - `MAX_HEADER_SIZE`: 16,384 bytes (returns `431 Request Header Fields Too Large`).
+  - `MAX_REQUEST_SIZE`: 65,536 bytes (returns `413 Payload Too Large`).
+- **Connection Guard**: Tracks active connections atomically. Rejects excess connections with `503 Service Unavailable` and drains unread socket buffers to prevent TCP RST anomalies.
+- **Socket Timeouts**: Socket read/write timeouts (10s) prevent slowloris-style hanging connections.
+
+> [!IMPORTANT]
+> All file body reads use bounded 64KB stack buffers (`[0u8; 65536]`). The server never loads entire static files into heap memory.
+
+---
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- [Rust Toolchain](https://www.rust-lang.org/tools/install) (Edition 2021)
+
+### Building & Running
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd veysrs
+
+# Check format & test
+cargo check
+cargo test
+
+# Build optimized release binary
+cargo build --release
+
+# Run veysrs on port 8989
+./target/release/veysrs --port 8989
+```
+
+### Verification
+
+```bash
+# Fetch root index page
+curl -i http://127.0.0.1:8989/
+
+# Inspect HEAD metadata (zero body read)
+curl -fsSI http://127.0.0.1:8989/index.html
+
+# Verify .veysrule file protection (403 Forbidden)
+curl -i http://127.0.0.1:8989/.veysrule
+```
+
+---
+
+## ⚙️ Configuration
+
+`veysrs` uses a hierarchical `.veysrule` configuration file. Directives defined at the root apply globally, while child `.veysrule` files in subdirectories inherit and override directory-level settings.
+
+### Configuration Directives
+
+| Directive | Type | Description | Default |
+|:---|:---|:---|:---|
+| `WORKERS` | Root-only | Number of worker threads in pool | `4` |
+| `MAX_REQUEST_SIZE` | Root-only | Maximum request body size in bytes | `65536` (64 KB) |
+| `MAX_HEADER_SIZE` | Root-only | Maximum total header block size in bytes | `16384` (16 KB) |
+| `MAX_HEADERS` | Root-only | Maximum number of headers per request | `64` |
+| `MAX_HEADER_LINE` | Root-only | Maximum length of a single header line | `8192` (8 KB) |
+| `MAX_URI_LENGTH` | Root-only | Maximum URI length in bytes | `8192` (8 KB) |
+| `READ_TIMEOUT` | Root-only | Socket read timeout in seconds | `10` |
+| `WRITE_TIMEOUT` | Root-only | Socket write timeout in seconds | `10` |
+| `KEEP_ALIVE_TIMEOUT` | Root-only | Idle Keep-Alive timeout in seconds | `10` |
+| `MAX_CONNECTIONS` | Root-only | Maximum simultaneous TCP connections | `1024` |
+| `MAX_REQUESTS_PER_CONNECTION` | Root-only | Max requests served per Keep-Alive connection | `100` |
+| `DENY_HIDDEN_FILES` | Directory | Block access to hidden files (`.env`, `.git`) | `true` |
+| `DENY_IP` | Directory | Block specific client IP addresses | None |
+| `ADD_HEADER` | Directory | Append custom HTTP response header (`Header: Value`) | None |
+| `REDIRECT_404` | Directory | Custom 404 error page path | None |
+
+### Sample `.veysrule`
+
+```ini
+# Global Server Resource Limits
+WORKERS = 4
+MAX_CONNECTIONS = 1024
+MAX_REQUESTS_PER_CONNECTION = 100
+READ_TIMEOUT = 10
+WRITE_TIMEOUT = 10
+KEEP_ALIVE_TIMEOUT = 10
+
+# Directory Directives
+DENY_HIDDEN_FILES = true
+ADD_HEADER = X-Powered-By: veysrs
+ADD_HEADER = X-Frame-Options: SAMEORIGIN
+REDIRECT_404 = 404.html
+```
+
+---
+
+## 🖥️ CLI Usage
+
+`veysrs` provides flexible command-line flags to override default configurations:
+
+```text
+USAGE:
+    veysrs [OPTIONS]
+
+OPTIONS:
+    --host <HOST>                  Host IP address to bind (default: 127.0.0.1)
+    --port <PORT>                  Port to listen on (default: 8080)
+    --root <DIR>                   Root directory for static files (default: ./public)
+    --config <FILE>                Path to root .veysrule file (default: ./.veysrule)
+    --workers <COUNT>              Number of worker threads (default: 4)
+    --max-connections <COUNT>      Maximum concurrent TCP connections (default: 1024)
+    --max-request-size <BYTES>     Maximum HTTP request size in bytes (default: 65536)
+    --dev                          Enable development mode (hot reload config)
+    --help, -h                     Print help information
+    --version, -v                  Print version information
+```
+
+---
+
+## 📂 Project Structure
+
+```text
+veysrs/
+├── .veysrule                  # Root server & security configuration
+├── Cargo.toml                 # Rust package manifest (0 external dependencies)
+├── Cargo.lock                 # Lockfile
+├── README.md                  # Project documentation
+├── docs/
+│   └── v0.3-hardening.md      # v0.3.0 hardening specification
+├── public/
+│   └── index.html             # Default static web asset
+├── release/
+│   └── veysrs-v0.3.0.tar.gz   # Clean release archive
+└── src/
+    ├── main.rs                # Entrypoint & CLI parser
+    ├── config/                # .veysrule parser & inheritance manager
+    │   ├── mod.rs
+    │   └── veysrule.rs
+    ├── router/                # Request handler, path normalization & security
+    │   ├── mod.rs
+    │   └── handler.rs
+    └── server/                # TCP listener, HTTP/1.1 parser & ThreadPool
+        ├── mod.rs
+        ├── http.rs
+        ├── listener.rs
+        └── threadpool.rs
+```
+
+---
+
+## 🧪 Testing
+
+The codebase includes unit tests covering configuration parsing, HTTP request/header validation, limit enforcement, threadpool panic isolation, and connection guards.
+
+```bash
+# Run format check
+cargo fmt --check
+
+# Run static analysis
+cargo check
+
+# Run unit test suite
+cargo test
+```
+
+> [!TIP]
+> All 19 unit tests pass cleanly out of the box (`19/19 passing`).
+
+---
+
+## 📦 Release
+
+Clean release archives are generated without build artifacts or temporary test files:
+
+- **Archive Location**: `release/veysrs-v0.3.0.tar.gz`
+
+### Building from Source Archive
+
+```bash
+# Extract release archive
+tar -xzf release/veysrs-v0.3.0.tar.gz
+cd veysrs-v0.3.0
+
+# Build release binary
+cargo build --release
+
+# Run production binary
+./target/release/veysrs --port 8080
+```
+
+---
+
+## ⚠️ Current Limitations
+
+- **No Native TLS/HTTPS**: Standard HTTP/1.1 only (use reverse proxies such as Nginx/Caddy for SSL termination).
+- **Chunked Transfer-Encoding Unimplemented**: `Transfer-Encoding: chunked` requests return `501 Not Implemented`.
+- **Static Assets Only**: Dynamic application execution (CGI/FastCGI/WSGI) is not supported by design.
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] HTTPS / TLS support via standard library hooks or minimal crypto wrappers.
+- [ ] HTTP Range requests (`206 Partial Content`) for media seeking.
+- [ ] Enhanced access logging formats (Combined Log Format / JSON struct logs).
+- [ ] Automated integration test runner script.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow these simple steps:
+
+1. Fork the repository.
+2. Create a topic branch (`git checkout -b feature/amazing-feature`).
+3. Ensure all tests pass (`cargo test`).
+4. Open a Pull Request with a clear summary of your changes.
+
+---
+
+## 📄 License
+
+> License information will be added before the first public release.
