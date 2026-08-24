@@ -5,13 +5,24 @@ mod server;
 use std::env;
 use std::path::PathBuf;
 
-use config::{parse_veysrule_file, ServerConfig};
+use config::{parse_veysrule_file, validate_veysrule_tree, ConfigManager, ServerConfig};
 use server::Server;
 
 const VERSION: &str = "0.5.0";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("config")
+        && args.get(2).map(String::as_str) == Some("test")
+    {
+        return run_config_test(&args[3..]);
+    }
+    if args.get(1).map(String::as_str) == Some("rules")
+        && args.get(2).map(String::as_str) == Some("show")
+    {
+        return run_rules_show(args.get(3).map(String::as_str));
+    }
 
     if args.contains(&"--help".to_string()) || args.contains(&"-h".to_string()) {
         print_help();
@@ -100,11 +111,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.config_file.exists() {
+        let config_path = config.config_file.clone();
         let (file_server_cfg, _, parse_errors) = parse_veysrule_file(&config.config_file, true);
-        for err in parse_errors {
-            eprintln!("[WARN] {}", err);
+        if !parse_errors.is_empty() {
+            for err in &parse_errors {
+                eprintln!("[ERROR] {}", err);
+            }
+            return Err(format!("{} configuration error(s)", parse_errors.len()).into());
         }
         config = file_server_cfg;
+        config.config_file = config_path;
     }
 
     if let Some(h) = cli_host {
@@ -144,6 +160,8 @@ veysrs - Lightweight HTTP/1.1 & HTTP/2 Web Server in Rust (v0.5.0)
 
 USAGE:
     veysrs [OPTIONS]
+    veysrs config test [--root <DIR>] [--config <FILE>]
+    veysrs rules show <DIRECTORY>
 
 OPTIONS:
     --host <HOST>                  Host IP address to bind (default: 127.0.0.1)
@@ -158,4 +176,58 @@ OPTIONS:
     --version, -v                  Print version information
 "#
     );
+}
+
+fn run_config_test(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = PathBuf::from("./public");
+    let mut config = PathBuf::from("./.veysrule");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" if i + 1 < args.len() => {
+                root = PathBuf::from(&args[i + 1]);
+                i += 1;
+            }
+            "--config" if i + 1 < args.len() => {
+                config = PathBuf::from(&args[i + 1]);
+                i += 1;
+            }
+            other => return Err(format!("unknown config test option '{other}'").into()),
+        }
+        i += 1;
+    }
+    let errors = validate_veysrule_tree(&root, Some(&config));
+    if errors.is_empty() {
+        println!("VeyRule configuration is valid");
+        Ok(())
+    } else {
+        for error in &errors {
+            eprintln!("{error}");
+        }
+        Err(format!("{} VeyRule error(s)", errors.len()).into())
+    }
+}
+
+fn run_rules_show(directory: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = directory.ok_or("rules show requires a directory")?;
+    let directory = std::fs::canonicalize(directory)?;
+    let root_config = directory.join(".veysrule");
+    let manager = ConfigManager::new();
+    let effective = manager.get_config_for_dir(
+        Some(&root_config),
+        &directory,
+        PathBuf::new().as_path(),
+        true,
+    );
+    println!("VeyRule\n=======\nDirectory: {}", directory.display());
+    println!("Headers: {:?}", effective.headers);
+    println!("Add headers: {:?}", effective.add_headers);
+    println!("Methods: {:?}", effective.methods);
+    println!("Index: {:?}", effective.index_files);
+    println!("Autoindex: {:?}", effective.autoindex);
+    println!("Cache: {:?}", effective.cache);
+    println!("Expires: {:?}", effective.expires);
+    println!("MIME: {:?}", effective.mime_types);
+    println!("Error pages: {:?}", effective.error_pages);
+    Ok(())
 }

@@ -74,6 +74,15 @@ impl<'a> RequestHandler<'a> {
             }
         };
 
+        // Rule files are server metadata, never static content. Check every
+        // normalized component before loading rules or opening a file.
+        if is_protected_rule_path(&rel_path) {
+            let resp = HttpResponse::new(StatusCode::NotFound)
+                .with_body(b"404 Not Found".to_vec(), "text/plain; charset=utf-8");
+            self.log_access(&peer_ip_str, req, &resp, start_time);
+            return resp;
+        }
+
         let merged_config = self.config_manager.get_config_for_dir(
             Some(&self.config.config_file),
             &self.config.root_dir,
@@ -85,23 +94,66 @@ impl<'a> RequestHandler<'a> {
             .deny_hidden_files
             .unwrap_or(self.config.deny_hidden_files);
 
+        if let Some(methods) = &merged_config.methods {
+            let method = req.method.to_string();
+            if !methods.iter().any(|m| m.eq_ignore_ascii_case(&method)) {
+                let resp = HttpResponse::new(StatusCode::MethodNotAllowed)
+                    .with_header("Allow", &methods.join(", "))
+                    .with_body(
+                        b"405 Method Not Allowed".to_vec(),
+                        "text/plain; charset=utf-8",
+                    );
+                self.log_access(&peer_ip_str, req, &resp, start_time);
+                return resp;
+            }
+        }
+
         if deny_hidden && has_hidden_component(&rel_path) {
             let mut resp = HttpResponse::new(StatusCode::Forbidden).with_body(
                 b"403 Forbidden: Access to hidden files is restricted".to_vec(),
                 "text/plain; charset=utf-8",
             );
             resp = apply_custom_headers(resp, &merged_config.headers);
+            resp = apply_rule_headers(resp, &merged_config);
             self.log_access(&peer_ip_str, req, &resp, start_time);
             return resp;
         }
 
         if let Some(addr) = peer_addr {
-            if merged_config.deny_ips.contains(&addr.ip()) {
+            if merged_config.deny_ips.contains(&addr.ip())
+                || merged_config
+                    .deny_networks
+                    .iter()
+                    .any(|network| network.contains(addr.ip()))
+                || (!merged_config.allow_networks.is_empty()
+                    && !merged_config
+                        .allow_networks
+                        .iter()
+                        .any(|network| network.contains(addr.ip())))
+            {
                 let mut resp = HttpResponse::new(StatusCode::Forbidden).with_body(
                     b"403 Forbidden: Access denied by IP rule".to_vec(),
                     "text/plain; charset=utf-8",
                 );
                 resp = apply_custom_headers(resp, &merged_config.headers);
+                resp = apply_rule_headers(resp, &merged_config);
+                self.log_access(&peer_ip_str, req, &resp, start_time);
+                return resp;
+            }
+        }
+
+        if let Some(rule) = &merged_config.redirect {
+            if rule.source == clean_path_str {
+                let status = match rule.status {
+                    301 => StatusCode::MovedPermanently,
+                    302 => StatusCode::Found,
+                    _ => StatusCode::Found,
+                };
+                let mut resp = HttpResponse::new(status)
+                    .with_header("Location", &rule.target)
+                    .with_body(Vec::new(), "text/plain; charset=utf-8");
+                resp = apply_custom_headers(resp, &merged_config.headers);
+                resp = apply_rule_headers(resp, &merged_config);
                 self.log_access(&peer_ip_str, req, &resp, start_time);
                 return resp;
             }
@@ -120,20 +172,48 @@ impl<'a> RequestHandler<'a> {
         };
 
         let open_path = if rel_path.as_os_str().is_empty() {
-            PathBuf::from("index.html")
+            PathBuf::from(
+                merged_config
+                    .index_files
+                    .as_ref()
+                    .and_then(|files| files.first())
+                    .map(String::as_str)
+                    .unwrap_or("index.html"),
+            )
         } else {
             rel_path.clone()
         };
-        let (file, actual_path) = match open_beneath(&canonical_root, &open_path) {
-            Ok(v) => v,
-            Err(_) => {
-                let mut resp = self.handle_404(&merged_config);
-                resp = apply_custom_headers(resp, &merged_config.headers);
-                self.log_access(&peer_ip_str, req, &resp, start_time);
-                return resp;
-            }
-        };
-        let mime_type = get_mime_type(&actual_path);
+        let configured_indexes: Vec<&str> = merged_config
+            .index_files
+            .as_ref()
+            .map(|files| files.iter().map(String::as_str).collect())
+            .unwrap_or_else(|| vec!["index.html"]);
+        let (file, actual_path) =
+            match open_beneath_with_index(&canonical_root, &open_path, &configured_indexes) {
+                Ok(v) => v,
+                Err(_) => {
+                    let mut resp = self.handle_404(&canonical_root, &merged_config);
+                    resp = apply_custom_headers(resp, &merged_config.headers);
+                    resp = apply_rule_headers(resp, &merged_config);
+                    self.log_access(&peer_ip_str, req, &resp, start_time);
+                    return resp;
+                }
+            };
+        let mime_type_owned = merged_config
+            .mime_types
+            .iter()
+            .find(|(extension, _)| {
+                actual_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{e}"))
+                    .as_deref()
+                    == Some(extension.as_str())
+            })
+            .map(|(_, mime)| mime.clone());
+        let mime_type = mime_type_owned
+            .as_deref()
+            .unwrap_or_else(|| get_mime_type(&actual_path));
 
         let mut resp = {
             let metadata = file.metadata().ok();
@@ -215,6 +295,16 @@ impl<'a> RequestHandler<'a> {
         };
 
         resp = apply_custom_headers(resp, &merged_config.headers);
+        resp = apply_rule_headers(resp, &merged_config);
+        if merged_config.cache == Some(true) {
+            resp = resp.with_header("Cache-Control", "public");
+        } else if merged_config.cache == Some(false) {
+            resp = resp.with_header("Cache-Control", "no-store");
+        }
+        if let Some(seconds) = merged_config.expires {
+            let expiry = SystemTime::now() + std::time::Duration::from_secs(seconds);
+            resp = resp.with_header("Expires", &format_http_date(expiry));
+        }
 
         // Enforce HEAD semantics: strip body regardless of status code
         if req.method == Method::Head {
@@ -225,15 +315,28 @@ impl<'a> RequestHandler<'a> {
         resp
     }
 
-    fn handle_404(&self, dir_config: &crate::config::DirectoryConfig) -> HttpResponse {
-        if let Some(ref redirect_path) = dir_config.redirect_404 {
-            let custom_404_path = self
-                .config
-                .root_dir
-                .join(redirect_path.trim_start_matches('/'));
-            if let Ok(content) = fs::read(&custom_404_path) {
-                let mime = get_mime_type(&custom_404_path);
-                return HttpResponse::new(StatusCode::NotFound).with_body(content, mime);
+    fn handle_404(
+        &self,
+        canonical_root: &Path,
+        dir_config: &crate::config::DirectoryConfig,
+    ) -> HttpResponse {
+        let configured_path = dir_config
+            .error_pages
+            .iter()
+            .find(|(status, _)| *status == 404)
+            .map(|(_, path)| path.as_str())
+            .or(dir_config.redirect_404.as_deref());
+        if let Some(path) = configured_path {
+            if let Ok(relative) = normalize_relative_path(path) {
+                if !is_protected_rule_path(&relative) {
+                    if let Ok((mut file, actual_path)) = open_beneath(canonical_root, &relative) {
+                        let mut content = Vec::new();
+                        if std::io::Read::read_to_end(&mut file, &mut content).is_ok() {
+                            return HttpResponse::new(StatusCode::NotFound)
+                                .with_body(content, get_mime_type(&actual_path));
+                        }
+                    }
+                }
             }
         }
 
@@ -271,6 +374,15 @@ impl<'a> RequestHandler<'a> {
 
 #[cfg(unix)]
 fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)> {
+    open_beneath_with_index(root, relative, &["index.html"])
+}
+
+#[cfg(unix)]
+fn open_beneath_with_index(
+    root: &Path,
+    relative: &Path,
+    index_files: &[&str],
+) -> std::io::Result<(File, PathBuf)> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -317,9 +429,17 @@ fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)
         let file = unsafe { File::from_raw_fd(fd) };
         if last {
             if file.metadata()?.is_dir() {
-                let mut index_path = relative.to_path_buf();
-                index_path.push("index.html");
-                return open_beneath(root, &index_path);
+                for index in index_files {
+                    let mut index_path = relative.to_path_buf();
+                    index_path.push(index);
+                    if let Ok(found) = open_beneath_with_index(root, &index_path, index_files) {
+                        return Ok(found);
+                    }
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "index not found",
+                ));
             }
             return Ok((file, root.join(relative)));
         }
@@ -335,11 +455,39 @@ fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)
     Ok((File::open(&path)?, path))
 }
 
+#[cfg(not(unix))]
+fn open_beneath_with_index(
+    root: &Path,
+    relative: &Path,
+    _index_files: &[&str],
+) -> std::io::Result<(File, PathBuf)> {
+    open_beneath(root, relative)
+}
+
 fn apply_custom_headers(mut resp: HttpResponse, headers: &[(String, String)]) -> HttpResponse {
     for (name, val) in headers {
         resp = resp.with_header(name, val);
     }
     resp
+}
+
+fn apply_rule_headers(
+    mut resp: HttpResponse,
+    config: &crate::config::DirectoryConfig,
+) -> HttpResponse {
+    for (name, value) in &config.add_headers {
+        resp = resp.with_header(name, value);
+    }
+    for name in &config.remove_headers {
+        resp.headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+    }
+    resp
+}
+
+fn is_protected_rule_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == ".veysrule"))
 }
 
 pub fn generate_etag(mtime_secs: u64, file_size: u64) -> String {
@@ -500,12 +648,18 @@ pub fn parse_range_header(header: &str, file_size: u64) -> Result<Option<RangeSp
 }
 
 pub fn percent_decode_recursive(input: &str) -> Option<String> {
-    let first_pass = percent_decode_single(input)?;
-    if first_pass.contains('%') {
-        percent_decode_single(&first_pass)
-    } else {
-        Some(first_pass)
+    let mut decoded = input.to_string();
+    for _ in 0..4 {
+        if !decoded.contains('%') {
+            return Some(decoded);
+        }
+        let next = percent_decode_single(&decoded)?;
+        if next == decoded {
+            break;
+        }
+        decoded = next;
     }
+    Some(decoded)
 }
 
 fn percent_decode_single(input: &str) -> Option<String> {
@@ -644,6 +798,10 @@ mod tests {
             percent_decode_recursive("/%2e%2e/Cargo.toml"),
             Some("/../Cargo.toml".to_string())
         );
+        assert_eq!(
+            percent_decode_recursive("/%2525252eveysrule"),
+            Some("/.veysrule".to_string())
+        );
     }
 
     #[test]
@@ -654,6 +812,13 @@ mod tests {
         assert!(has_hidden_component(Path::new("sub/.hidden/file.txt")));
         assert!(!has_hidden_component(Path::new("index.html")));
         assert!(!has_hidden_component(Path::new("style.css")));
+    }
+
+    #[test]
+    fn test_protected_rule_path_is_recursive() {
+        assert!(is_protected_rule_path(Path::new(".veysrule")));
+        assert!(is_protected_rule_path(Path::new("nested/.veysrule")));
+        assert!(!is_protected_rule_path(Path::new("nested/file.txt")));
     }
 
     #[test]

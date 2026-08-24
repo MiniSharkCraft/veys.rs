@@ -38,6 +38,8 @@ impl From<&str> for Method {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StatusCode {
     Ok = 200,
+    MovedPermanently = 301,
+    Found = 302,
     PartialContent = 206,
     NotModified = 304,
     BadRequest = 400,
@@ -63,6 +65,8 @@ impl StatusCode {
     pub fn reason_phrase(&self) -> &'static str {
         match self {
             StatusCode::Ok => "OK",
+            StatusCode::MovedPermanently => "Moved Permanently",
+            StatusCode::Found => "Found",
             StatusCode::PartialContent => "Partial Content",
             StatusCode::NotModified => "Not Modified",
             StatusCode::BadRequest => "Bad Request",
@@ -175,10 +179,20 @@ pub fn parse_http_request_from_buf_with_limits(
     };
 
     let header_bytes = &buffer[..header_end];
+    // HTTP/1.1 uses CRLF exclusively. `str::lines()` also accepts bare LF,
+    // which can create parser differentials with a proxy in front of VeySRS.
+    for (idx, byte) in header_bytes.iter().enumerate() {
+        if *byte == b'\n' && (idx == 0 || header_bytes[idx - 1] != b'\r') {
+            return Err(HttpParseError::MalformedRequest);
+        }
+        if *byte == b'\r' && (idx + 1 >= header_bytes.len() || header_bytes[idx + 1] != b'\n') {
+            return Err(HttpParseError::MalformedRequest);
+        }
+    }
     let header_str =
         std::str::from_utf8(header_bytes).map_err(|_| HttpParseError::MalformedRequest)?;
 
-    let mut lines = header_str.lines();
+    let mut lines = header_str.split("\r\n");
 
     // 1. Request Line Parsing & Limits
     let request_line = lines.next().ok_or(HttpParseError::MalformedRequest)?;
@@ -602,6 +616,20 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: localhost\r\n Host: attacker\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: localhost\r\nBad(Name): value\r\n\r\n".as_slice(),
             b"GET\t/ HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        ] {
+            let mut buf = request.to_vec();
+            assert_eq!(
+                parse_http_request_from_buf(&mut buf).unwrap_err(),
+                HttpParseError::MalformedRequest
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_bare_lf_and_bare_cr_in_headers() {
+        for request in [
+            b"GET / HTTP/1.1\r\nHost: localhost\nX-Test: accepted\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: localhost\rX-Test: accepted\r\n\r\n".as_slice(),
         ] {
             let mut buf = request.to_vec();
             assert_eq!(

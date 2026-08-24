@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{ConfigManager, ServerConfig};
 use crate::router::RequestHandler;
@@ -173,11 +173,24 @@ impl Server {
 
                             if config.http2_enabled {
                                 let mut peek_buf = [0u8; 24];
-                                let n = stream.peek(&mut peek_buf).unwrap_or(0);
-                                if n >= crate::server::http2::CLIENT_PREFACE.len()
-                                    && &peek_buf[..crate::server::http2::CLIENT_PREFACE.len()]
-                                        == crate::server::http2::CLIENT_PREFACE
-                                {
+                                let preface = crate::server::http2::CLIENT_PREFACE;
+                                let deadline = Instant::now() + Duration::from_secs(1);
+                                let mut is_h2 = false;
+                                loop {
+                                    let n = stream.peek(&mut peek_buf).unwrap_or(0);
+                                    if n >= preface.len() {
+                                        is_h2 = &peek_buf[..preface.len()] == preface;
+                                        break;
+                                    }
+                                    if n == 0
+                                        || !preface.starts_with(&peek_buf[..n])
+                                        || Instant::now() >= deadline
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                if is_h2 {
                                     let mut h2 = crate::server::http2::Http2Connection::new(
                                         &config,
                                         &config_manager,

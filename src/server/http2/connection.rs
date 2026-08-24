@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 
 use crate::config::{ConfigManager, ServerConfig};
@@ -15,6 +16,41 @@ use crate::server::http2::stream::{Stream, StreamState};
 
 /// Chuỗi Magic Client Preface tiêu chuẩn (24 bytes) theo RFC 9113 Section 3.4
 pub const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+struct PendingResponse {
+    stream_id: u32,
+    body: PendingBody,
+}
+
+enum PendingBody {
+    Bytes { data: Vec<u8>, offset: usize },
+    File { file: File, remaining: u64 },
+}
+
+impl PendingBody {
+    fn read_chunk(&mut self, max: usize) -> Result<(Vec<u8>, bool), Http2ErrorCode> {
+        match self {
+            Self::Bytes { data, offset } => {
+                let end = (*offset + max).min(data.len());
+                let chunk = data[*offset..end].to_vec();
+                *offset = end;
+                Ok((chunk, *offset == data.len()))
+            }
+            Self::File { file, remaining } => {
+                let mut buf = vec![0u8; (*remaining as usize).min(max)];
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|_| Http2ErrorCode::InternalError)?;
+                if n == 0 {
+                    return Err(Http2ErrorCode::InternalError);
+                }
+                buf.truncate(n);
+                *remaining -= n as u64;
+                Ok((buf, *remaining == 0))
+            }
+        }
+    }
+}
 
 /// HTTP/2 Connection Driver chính xử lý một kết nối HTTP/2 qua TcpStream
 pub struct Http2Connection<'a> {
@@ -35,6 +71,8 @@ pub struct Http2Connection<'a> {
     pending_header_block: Vec<u8>,
     read_buffer: Vec<u8>,
     deferred_frames: VecDeque<Frame>,
+    pending_responses: VecDeque<PendingResponse>,
+    closed_streams: VecDeque<u32>,
 }
 
 impl<'a> Http2Connection<'a> {
@@ -57,6 +95,8 @@ impl<'a> Http2Connection<'a> {
             pending_header_block: Vec::new(),
             read_buffer: Vec::new(),
             deferred_frames: VecDeque::new(),
+            pending_responses: VecDeque::new(),
+            closed_streams: VecDeque::new(),
         }
     }
 
@@ -93,6 +133,14 @@ impl<'a> Http2Connection<'a> {
 
         // 3. Main Loop đọc và xử lý Frame
         loop {
+            match self.schedule_pending_responses(stream) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    let _ = self.send_goaway(stream, self.last_stream_id, err);
+                    break;
+                }
+            }
             if let Some(frame) = self.deferred_frames.pop_front() {
                 if let Err(err) = self.process_frame(stream, &frame, &handler, peer_addr) {
                     let _ = self.send_goaway(stream, self.last_stream_id, err);
@@ -320,7 +368,6 @@ impl<'a> Http2Connection<'a> {
                         let st_clone = st.clone();
                         self.dispatch_h2_request(stream, &st_clone, handler, peer_addr)?;
                         self.active_streams.remove(&sid);
-                        self.send_stream_windows.remove(&sid);
                     }
                 } else {
                     if header_block.len() > self.config.http2_max_header_block_size {
@@ -359,7 +406,6 @@ impl<'a> Http2Connection<'a> {
                             let st_clone = st.clone();
                             self.dispatch_h2_request(stream, &st_clone, handler, peer_addr)?;
                             self.active_streams.remove(&sid);
-                            self.send_stream_windows.remove(&sid);
                         }
                     }
                 }
@@ -428,7 +474,6 @@ impl<'a> Http2Connection<'a> {
                     st.append_request_data(data, *end_stream)?;
                     if *end_stream {
                         self.dispatch_h2_request(stream, &st, handler, peer_addr)?;
-                        self.send_stream_windows.remove(&sid);
                     } else {
                         self.active_streams.insert(sid, st);
                     }
@@ -448,6 +493,10 @@ impl<'a> Http2Connection<'a> {
                         .entry(sid)
                         .or_insert_with(|| Window::new(self.peer_initial_stream_window_size))
                         .update(*window_size_increment)?;
+                } else if let Some(window) = self.send_stream_windows.get_mut(&sid) {
+                    window.update(*window_size_increment)?;
+                } else if self.closed_streams.contains(&sid) {
+                    // A WINDOW_UPDATE may already be in flight when a stream closes.
                 } else {
                     return Err(Http2ErrorCode::ProtocolError);
                 }
@@ -456,6 +505,8 @@ impl<'a> Http2Connection<'a> {
             FramePayload::RstStream { .. } => {
                 self.active_streams.remove(&sid);
                 self.send_stream_windows.remove(&sid);
+                self.pending_responses.retain(|p| p.stream_id != sid);
+                self.mark_closed_stream(sid);
             }
 
             FramePayload::GoAway { .. } => {
@@ -504,11 +555,11 @@ impl<'a> Http2Connection<'a> {
         let resp = handler.handle_request(&req, peer_addr);
 
         // Convert HttpResponse -> HTTP/2 HEADERS & DATA frames
-        self.send_h2_response(stream, h2_stream.id, &resp)?;
+        self.queue_h2_response(stream, h2_stream.id, &resp)?;
         Ok(())
     }
 
-    fn send_h2_response(
+    fn queue_h2_response(
         &mut self,
         stream: &mut TcpStream,
         stream_id: u32,
@@ -522,9 +573,6 @@ impl<'a> Http2Connection<'a> {
         }
 
         let encoded_headers = self.hpack_encoder.encode_headers(&h2_headers);
-        if encoded_headers.len() as u32 > self.peer_max_frame_size {
-            return Err(Http2ErrorCode::InternalError);
-        }
 
         let has_body = match &resp.body_source {
             BodySource::Bytes(b) => !b.is_empty(),
@@ -532,235 +580,162 @@ impl<'a> Http2Connection<'a> {
             BodySource::FileRange(_, _, size) => *size > 0,
         };
 
-        let headers_flags = if has_body {
+        let max = self.peer_max_frame_size as usize;
+        let first = encoded_headers.len().min(max);
+        let mut first_flags = if first == encoded_headers.len() {
             flags::END_HEADERS
         } else {
-            flags::END_HEADERS | flags::END_STREAM
+            0
         };
-
-        let headers_frame = Frame {
+        if !has_body {
+            first_flags |= flags::END_STREAM;
+        }
+        let frame = Frame {
             header: FrameHeader {
-                length: encoded_headers.len() as u32,
+                length: first as u32,
                 frame_type: FrameType::Headers,
-                flags: headers_flags,
+                flags: first_flags,
                 stream_id,
             },
             payload: FramePayload::Headers {
-                header_block: encoded_headers,
+                header_block: encoded_headers[..first].to_vec(),
                 end_stream: !has_body,
-                end_headers: true,
+                end_headers: first == encoded_headers.len(),
             },
         };
-
-        if stream.write_all(&headers_frame.encode()).is_err() {
-            return Err(Http2ErrorCode::InternalError);
-        }
-
-        if has_body {
-            match &resp.body_source {
-                BodySource::Bytes(bytes) => {
-                    self.send_data(stream, stream_id, bytes, true)?;
-                }
-                BodySource::File(file, size) => {
-                    let mut file = file
-                        .try_clone()
-                        .map_err(|_| Http2ErrorCode::InternalError)?;
-                    let mut remaining = *size;
-                    let mut buffer = [0u8; 16384];
-                    while remaining > 0 {
-                        let to_read = remaining.min(buffer.len() as u64) as usize;
-                        let n = file
-                            .read(&mut buffer[..to_read])
-                            .map_err(|_| Http2ErrorCode::InternalError)?;
-                        if n == 0 {
-                            return Err(Http2ErrorCode::InternalError);
-                        }
-                        remaining -= n as u64;
-                        self.send_data(stream, stream_id, &buffer[..n], remaining == 0)?;
-                    }
-                }
-                BodySource::FileRange(file, offset, length) => {
-                    let mut f = file
-                        .try_clone()
-                        .map_err(|_| Http2ErrorCode::InternalError)?;
-                    use std::io::Seek;
-                    f.seek(std::io::SeekFrom::Start(*offset))
-                        .map_err(|_| Http2ErrorCode::InternalError)?;
-                    let mut remaining = *length;
-                    let mut buffer = [0u8; 16384];
-
-                    while remaining > 0 {
-                        let to_read = (remaining as usize).min(buffer.len());
-                        let n = f
-                            .read(&mut buffer[..to_read])
-                            .map_err(|_| Http2ErrorCode::InternalError)?;
-                        if n == 0 {
-                            return Err(Http2ErrorCode::InternalError);
-                        }
-                        remaining -= n as u64;
-                        let is_last = remaining == 0;
-
-                        self.send_data(stream, stream_id, &buffer[..n], is_last)?;
-                    }
-                }
-            }
-        }
-
-        let _ = stream.flush();
-        Ok(())
-    }
-
-    fn send_data(
-        &mut self,
-        stream: &mut TcpStream,
-        stream_id: u32,
-        data: &[u8],
-        end_stream: bool,
-    ) -> Result<(), Http2ErrorCode> {
-        let mut offset = 0;
-        while offset < data.len() {
-            while self.peer_connection_window.available() <= 0
-                || self
-                    .send_stream_windows
-                    .get(&stream_id)
-                    .ok_or(Http2ErrorCode::StreamClosed)?
-                    .available()
-                    <= 0
-            {
-                self.wait_for_window_update(stream, stream_id)?;
-            }
-
-            let conn = self.peer_connection_window.available() as usize;
-            let stream_window = self.send_stream_windows[&stream_id].available() as usize;
-            let amount = (data.len() - offset)
-                .min(self.peer_max_frame_size as usize)
-                .min(conn)
-                .min(stream_window);
-            if amount == 0 {
-                continue;
-            }
-            let final_frame = end_stream && offset + amount == data.len();
-            self.peer_connection_window.consume(amount as u32)?;
-            self.send_stream_windows
-                .get_mut(&stream_id)
-                .ok_or(Http2ErrorCode::StreamClosed)?
-                .consume(amount as u32)?;
+        stream
+            .write_all(&frame.encode())
+            .map_err(|_| Http2ErrorCode::InternalError)?;
+        let mut offset = first;
+        while offset < encoded_headers.len() {
+            let end = (offset + max).min(encoded_headers.len());
+            let final_fragment = end == encoded_headers.len();
             let frame = Frame {
                 header: FrameHeader {
-                    length: amount as u32,
-                    frame_type: FrameType::Data,
-                    flags: if final_frame { flags::END_STREAM } else { 0 },
+                    length: (end - offset) as u32,
+                    frame_type: FrameType::Continuation,
+                    flags: if final_fragment {
+                        flags::END_HEADERS
+                    } else {
+                        0
+                    },
                     stream_id,
                 },
-                payload: FramePayload::Data {
-                    data: data[offset..offset + amount].to_vec(),
-                    end_stream: final_frame,
+                payload: FramePayload::Continuation {
+                    header_block: encoded_headers[offset..end].to_vec(),
+                    end_headers: final_fragment,
                 },
             };
             stream
                 .write_all(&frame.encode())
                 .map_err(|_| Http2ErrorCode::InternalError)?;
-            offset += amount;
+            offset = end;
         }
+        if has_body {
+            let body = match &resp.body_source {
+                BodySource::Bytes(data) => PendingBody::Bytes {
+                    data: data.clone(),
+                    offset: 0,
+                },
+                BodySource::File(file, size) => PendingBody::File {
+                    file: file
+                        .try_clone()
+                        .map_err(|_| Http2ErrorCode::InternalError)?,
+                    remaining: *size,
+                },
+                BodySource::FileRange(file, start, length) => {
+                    let mut f = file
+                        .try_clone()
+                        .map_err(|_| Http2ErrorCode::InternalError)?;
+                    f.seek(SeekFrom::Start(*start))
+                        .map_err(|_| Http2ErrorCode::InternalError)?;
+                    PendingBody::File {
+                        file: f,
+                        remaining: *length,
+                    }
+                }
+            };
+            self.pending_responses
+                .push_back(PendingResponse { stream_id, body });
+        }
+        stream.flush().map_err(|_| Http2ErrorCode::InternalError)?;
         Ok(())
     }
 
-    fn wait_for_window_update(
+    fn schedule_pending_responses(
         &mut self,
         stream: &mut TcpStream,
-        stream_id: u32,
-    ) -> Result<(), Http2ErrorCode> {
-        let mut header_bytes = [0u8; FRAME_HEADER_SIZE];
-        self.read_into_buffer(stream, FRAME_HEADER_SIZE)?;
-        header_bytes.copy_from_slice(&self.read_buffer[..FRAME_HEADER_SIZE]);
-        self.read_buffer.drain(..FRAME_HEADER_SIZE);
-        let header = FrameHeader::parse(&header_bytes)?;
-        if header.length > self.max_frame_size {
-            return Err(Http2ErrorCode::FrameSizeError);
+    ) -> Result<bool, Http2ErrorCode> {
+        let rounds = self.pending_responses.len();
+        if rounds == 0 || self.peer_connection_window.available() <= 0 {
+            return Ok(false);
         }
-        self.read_into_buffer(stream, header.length as usize)?;
-        let payload = self.read_buffer[..header.length as usize].to_vec();
-        self.read_buffer.drain(..header.length as usize);
-        let frame = Frame::parse(header, &payload)?;
-        match frame.payload {
-            FramePayload::WindowUpdate {
-                window_size_increment,
-            } if frame.header.stream_id == 0 => {
-                self.peer_connection_window.update(window_size_increment)?;
+        let quota = (self.peer_connection_window.available() as usize / rounds).max(1);
+        let mut sent = false;
+        for _ in 0..rounds {
+            let mut pending = match self.pending_responses.pop_front() {
+                Some(p) => p,
+                None => break,
+            };
+            let stream_window = match self.send_stream_windows.get(&pending.stream_id) {
+                Some(w) => w.available(),
+                None => continue,
+            };
+            if stream_window <= 0 || self.peer_connection_window.available() <= 0 {
+                self.pending_responses.push_back(pending);
+                continue;
             }
-            FramePayload::WindowUpdate {
-                window_size_increment,
-            } if frame.header.stream_id != 0 => {
-                self.send_stream_windows
-                    .get_mut(&frame.header.stream_id)
-                    .ok_or(Http2ErrorCode::StreamClosed)?
-                    .update(window_size_increment)?;
+            let amount = quota
+                .min(self.peer_max_frame_size as usize)
+                .min(self.peer_connection_window.available() as usize)
+                .min(stream_window as usize);
+            let (data, done) = pending.body.read_chunk(amount)?;
+            if data.is_empty() {
+                self.pending_responses.push_back(pending);
+                continue;
             }
-            FramePayload::Ping {
-                opaque_data,
-                ack: false,
-            } => {
-                let ack = Frame {
-                    header: FrameHeader {
-                        length: 8,
-                        frame_type: FrameType::Ping,
-                        flags: flags::ACK,
-                        stream_id: 0,
-                    },
-                    payload: FramePayload::Ping {
-                        opaque_data,
-                        ack: true,
-                    },
-                };
-                stream
-                    .write_all(&ack.encode())
-                    .map_err(|_| Http2ErrorCode::InternalError)?;
-            }
-            FramePayload::Settings { ack: true, .. } => {}
-            FramePayload::Settings { ack: false, .. } => {
-                let ack = Frame {
-                    header: FrameHeader {
-                        length: 0,
-                        frame_type: FrameType::Settings,
-                        flags: flags::ACK,
-                        stream_id: 0,
-                    },
-                    payload: FramePayload::Settings {
-                        settings: Vec::new(),
-                        ack: true,
-                    },
-                };
-                stream
-                    .write_all(&ack.encode())
-                    .map_err(|_| Http2ErrorCode::InternalError)?;
-            }
-            FramePayload::RstStream { .. } if frame.header.stream_id == stream_id => {
-                return Err(Http2ErrorCode::StreamClosed);
-            }
-            ref _other => {
-                self.deferred_frames.push_back(frame);
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    fn read_into_buffer(
-        &mut self,
-        stream: &mut TcpStream,
-        required: usize,
-    ) -> Result<(), Http2ErrorCode> {
-        while self.read_buffer.len() < required {
-            let mut temp = [0u8; 4096];
-            let n = stream
-                .read(&mut temp)
+            self.peer_connection_window.consume(data.len() as u32)?;
+            self.send_stream_windows
+                .get_mut(&pending.stream_id)
+                .ok_or(Http2ErrorCode::StreamClosed)?
+                .consume(data.len() as u32)?;
+            let frame = Frame {
+                header: FrameHeader {
+                    length: data.len() as u32,
+                    frame_type: FrameType::Data,
+                    flags: if done { flags::END_STREAM } else { 0 },
+                    stream_id: pending.stream_id,
+                },
+                payload: FramePayload::Data {
+                    data,
+                    end_stream: done,
+                },
+            };
+            stream
+                .write_all(&frame.encode())
                 .map_err(|_| Http2ErrorCode::InternalError)?;
-            if n == 0 {
-                return Err(Http2ErrorCode::InternalError);
+            sent = true;
+            if !done {
+                self.pending_responses.push_back(pending);
+            } else {
+                self.send_stream_windows.remove(&pending.stream_id);
+                self.mark_closed_stream(pending.stream_id);
             }
-            self.read_buffer.extend_from_slice(&temp[..n]);
         }
-        Ok(())
+        if sent {
+            stream.flush().map_err(|_| Http2ErrorCode::InternalError)?;
+        }
+        Ok(sent)
+    }
+    fn mark_closed_stream(&mut self, stream_id: u32) {
+        if self.closed_streams.contains(&stream_id) {
+            return;
+        }
+        self.closed_streams.push_back(stream_id);
+        let limit = self.max_concurrent_streams.saturating_mul(2).max(16);
+        while self.closed_streams.len() > limit {
+            self.closed_streams.pop_front();
+        }
     }
 
     fn send_goaway(
