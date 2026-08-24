@@ -12,6 +12,31 @@ use crate::server::http::{
 };
 use crate::server::threadpool::ThreadPool;
 
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_shutdown_handlers() -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn signal(signal: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+    // SIGINT and SIGTERM.  The handler only stores to an atomic, which is
+    // async-signal-safe; the accept loop performs all shutdown work.
+    unsafe {
+        signal(2, request_shutdown);
+        signal(15, request_shutdown);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_handlers() -> std::io::Result<()> {
+    Ok(())
+}
+
 pub struct Server {
     config: Arc<ServerConfig>,
     config_manager: Arc<ConfigManager>,
@@ -71,17 +96,10 @@ impl Server {
         let pool = ThreadPool::new(self.config.workers).map_err(std::io::Error::other)?;
 
         let active_connections = Arc::new(AtomicUsize::new(0));
-        let running = Arc::new(AtomicBool::new(true));
-        let r_clone = Arc::clone(&running);
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        install_shutdown_handlers()?;
 
-        let _ = ctrlc_handler(move || {
-            println!("\n[INFO] Shutdown signal received");
-            println!("[INFO] Stopping listener");
-            println!("[INFO] Waiting for workers...");
-            r_clone.store(false, Ordering::SeqCst);
-        });
-
-        while running.load(Ordering::SeqCst) {
+        while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut stream, peer_addr)) => {
                     // Accepted sockets on Linux inherit O_NONBLOCK from the listener
@@ -98,6 +116,15 @@ impl Server {
                     if let Err(e) = stream.set_nonblocking(false) {
                         eprintln!("[ERROR] Failed to set stream to blocking: {}", e);
                         continue;
+                    }
+
+                    // Enforce I/O timeouts to prevent Slowloris and thread starvation
+                    let timeout = Some(std::time::Duration::from_secs(30));
+                    if let Err(e) = stream.set_read_timeout(timeout) {
+                        eprintln!("[ERROR] Failed to set read timeout: {}", e);
+                    }
+                    if let Err(e) = stream.set_write_timeout(timeout) {
+                        eprintln!("[ERROR] Failed to set write timeout: {}", e);
                     }
 
                     let guard = match ConnectionGuard::try_acquire(
@@ -126,103 +153,126 @@ impl Server {
                     let config = Arc::clone(&self.config);
                     let config_manager = Arc::clone(&self.config_manager);
 
-                    let _ = thread::spawn(move || {
-                        let _guard = guard;
+                    if pool
+                        .execute(move || {
+                            let _guard = guard;
 
-                        let _ =
-                            stream.set_read_timeout(Some(Duration::from_secs(config.read_timeout)));
-                        let _ = stream
-                            .set_write_timeout(Some(Duration::from_secs(config.write_timeout)));
+                            let _ = stream
+                                .set_read_timeout(Some(Duration::from_secs(config.read_timeout)));
+                            let _ = stream
+                                .set_write_timeout(Some(Duration::from_secs(config.write_timeout)));
 
-                        let handler = RequestHandler::new(&config, &config_manager);
+                            let handler = RequestHandler::new(&config, &config_manager);
 
-                        if config.http2_enabled {
-                            let mut peek_buf = [0u8; 24];
-                            let n = stream.peek(&mut peek_buf).unwrap_or(0);
-                            if n >= crate::server::http2::CLIENT_PREFACE.len()
-                                && &peek_buf[..crate::server::http2::CLIENT_PREFACE.len()]
-                                    == crate::server::http2::CLIENT_PREFACE
-                            {
-                                let mut h2 = crate::server::http2::Http2Connection::new(
-                                    &config,
-                                    &config_manager,
-                                );
-                                let _ = h2.handle_connection(&mut stream, &[], Some(peer_addr));
-                                return;
-                            }
-                        }
+                            // Partial request headers must not occupy a worker for the
+                            // full keep-alive/read budget. Once a complete request is
+                            // served, the configured keep-alive timeout applies.
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(
+                                config.read_timeout.min(1),
+                            )));
 
-                        let mut conn_buf = Vec::new();
-                        let mut request_count = 0;
-
-                        loop {
-                            match parse_http_request_from_buf_with_limits(&mut conn_buf, &config) {
-                                Ok(Some(req)) => {
-                                    request_count += 1;
-                                    let is_last_request = request_count
-                                        >= config.max_requests_per_connection
-                                        || !req.is_keep_alive();
-
-                                    let mut resp = handler.handle_request(&req, Some(peer_addr));
-                                    resp = resp.set_close_connection(is_last_request);
-
-                                    if resp.send_to(&mut stream).is_err() {
-                                        break;
-                                    }
-
-                                    if is_last_request {
-                                        break;
-                                    }
-
-                                    let _ = stream.set_read_timeout(Some(Duration::from_secs(
-                                        config.keep_alive_timeout,
-                                    )));
+                            if config.http2_enabled {
+                                let mut peek_buf = [0u8; 24];
+                                let n = stream.peek(&mut peek_buf).unwrap_or(0);
+                                if n >= crate::server::http2::CLIENT_PREFACE.len()
+                                    && &peek_buf[..crate::server::http2::CLIENT_PREFACE.len()]
+                                        == crate::server::http2::CLIENT_PREFACE
+                                {
+                                    let mut h2 = crate::server::http2::Http2Connection::new(
+                                        &config,
+                                        &config_manager,
+                                    );
+                                    let _ = h2.handle_connection(&mut stream, &[], Some(peer_addr));
+                                    return;
                                 }
-                                Ok(None) => {
-                                    let mut temp_buf = [0u8; 1024];
-                                    match stream.read(&mut temp_buf) {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            conn_buf.extend_from_slice(&temp_buf[..n]);
-                                        }
-                                        Err(ref e)
-                                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                                        {
-                                            if !conn_buf.is_empty() {
-                                                let resp =
-                                                    HttpResponse::new(StatusCode::RequestTimeout)
-                                                        .set_close_connection(true)
-                                                        .with_body(
-                                                            b"408 Request Timeout".to_vec(),
-                                                            "text/plain; charset=utf-8",
-                                                        );
-                                                let _ = resp.send_to(&mut stream);
-                                            }
+                            }
+
+                            let mut conn_buf = Vec::new();
+                            let mut request_count = 0;
+
+                            loop {
+                                match parse_http_request_from_buf_with_limits(
+                                    &mut conn_buf,
+                                    &config,
+                                ) {
+                                    Ok(Some(req)) => {
+                                        request_count += 1;
+                                        let is_last_request = request_count
+                                            >= config.max_requests_per_connection
+                                            || !req.is_keep_alive();
+
+                                        let mut resp =
+                                            handler.handle_request(&req, Some(peer_addr));
+                                        resp = resp.set_close_connection(is_last_request);
+
+                                        if resp.send_to(&mut stream).is_err() {
                                             break;
                                         }
-                                        Err(_) => break,
+
+                                        if is_last_request {
+                                            break;
+                                        }
+
+                                        let _ = stream.set_read_timeout(Some(Duration::from_secs(
+                                            config.keep_alive_timeout,
+                                        )));
                                     }
-                                }
-                                Err(HttpParseError::ConnectionClosed) => break,
-                                Err(parse_err) => {
-                                    let status: StatusCode = parse_err.into();
-                                    let mut resp = HttpResponse::new(status)
-                                        .set_close_connection(true)
-                                        .with_body(
-                                            format!("{} {}", status.code(), status.reason_phrase())
+                                    Ok(None) => {
+                                        let mut temp_buf = [0u8; 1024];
+                                        match stream.read(&mut temp_buf) {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                conn_buf.extend_from_slice(&temp_buf[..n]);
+                                            }
+                                            Err(ref e)
+                                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                                            {
+                                                if !conn_buf.is_empty() {
+                                                    let resp = HttpResponse::new(
+                                                        StatusCode::RequestTimeout,
+                                                    )
+                                                    .set_close_connection(true)
+                                                    .with_body(
+                                                        b"408 Request Timeout".to_vec(),
+                                                        "text/plain; charset=utf-8",
+                                                    );
+                                                    let _ = resp.send_to(&mut stream);
+                                                }
+                                                break;
+                                            }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                    Err(HttpParseError::ConnectionClosed) => break,
+                                    Err(parse_err) => {
+                                        let status: StatusCode = parse_err.into();
+                                        let mut resp = HttpResponse::new(status)
+                                            .set_close_connection(true)
+                                            .with_body(
+                                                format!(
+                                                    "{} {}",
+                                                    status.code(),
+                                                    status.reason_phrase()
+                                                )
                                                 .into_bytes(),
-                                            "text/plain; charset=utf-8",
-                                        );
-                                    if status == StatusCode::MethodNotAllowed {
-                                        resp = resp.with_header("Allow", "GET, HEAD");
+                                                "text/plain; charset=utf-8",
+                                            );
+                                        if status == StatusCode::MethodNotAllowed {
+                                            resp = resp.with_header("Allow", "GET, HEAD");
+                                        }
+                                        let _ = resp.send_to(&mut stream);
+                                        break;
                                     }
-                                    let _ = resp.send_to(&mut stream);
-                                    break;
                                 }
                             }
-                        }
-                    });
+                        })
+                        .is_err()
+                    {
+                        // The pool only shuts down during server teardown; dropping the
+                        // stream and guard is safer than creating an unbounded fallback.
+                        eprintln!("[ERROR] Failed to schedule connection worker");
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(1));
@@ -233,26 +283,11 @@ impl Server {
             }
         }
 
+        println!("[INFO] Shutdown signal received; waiting for active workers");
         drop(pool);
         println!("[INFO] Server stopped.");
         Ok(())
     }
-}
-
-fn ctrlc_handler<F>(f: F) -> Result<(), std::io::Error>
-where
-    F: FnOnce() + Send + 'static,
-{
-    let handler = std::sync::Mutex::new(Some(f));
-    let _ = thread::spawn(move || {
-        thread::park();
-        if let Ok(mut guard) = handler.lock() {
-            if let Some(func) = guard.take() {
-                func();
-            }
-        }
-    });
-    Ok(())
 }
 
 #[cfg(test)]

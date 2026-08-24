@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::config::ServerConfig;
 
@@ -183,8 +183,12 @@ pub fn parse_http_request_from_buf_with_limits(
     // 1. Request Line Parsing & Limits
     let request_line = lines.next().ok_or(HttpParseError::MalformedRequest)?;
 
-    let rl_parts: Vec<&str> = request_line.split_whitespace().collect();
-    if rl_parts.len() != 3 {
+    let rl_parts: Vec<&str> = request_line.split(' ').collect();
+    if rl_parts.len() != 3
+        || rl_parts
+            .iter()
+            .any(|part| part.is_empty() || part.contains('\t'))
+    {
         return Err(HttpParseError::MalformedRequest);
     }
 
@@ -216,7 +220,6 @@ pub fn parse_http_request_from_buf_with_limits(
     let mut headers = Vec::new();
     let mut host_headers = Vec::new();
     let mut content_length_values = Vec::new();
-    let mut has_transfer_encoding = false;
 
     for line in lines {
         if line.trim().is_empty() {
@@ -236,12 +239,13 @@ pub fn parse_http_request_from_buf_with_limits(
             return Err(HttpParseError::MalformedRequest);
         }
 
-        let name = parts[0].trim().to_string();
-        let value = parts[1].trim().to_string();
-
-        if name.is_empty() || name.bytes().any(|b| b <= 32 || b >= 127 || b == b':') {
+        let raw_name = parts[0];
+        if raw_name.is_empty() || !raw_name.bytes().all(is_tchar) {
             return Err(HttpParseError::MalformedRequest);
         }
+
+        let name = raw_name.to_string();
+        let value = parts[1].trim().to_string();
 
         if value.contains('\r') || value.contains('\n') {
             return Err(HttpParseError::MalformedRequest);
@@ -252,10 +256,7 @@ pub fn parse_http_request_from_buf_with_limits(
         } else if name.eq_ignore_ascii_case("Content-Length") {
             content_length_values.push(value.clone());
         } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
-            has_transfer_encoding = true;
-            if value.to_lowercase().contains("chunked") {
-                return Err(HttpParseError::ChunkedEncodingNotImplemented);
-            }
+            return Err(HttpParseError::ChunkedEncodingNotImplemented);
         }
 
         headers.push((name, value));
@@ -269,10 +270,6 @@ pub fn parse_http_request_from_buf_with_limits(
     }
     if host_headers[0].trim().is_empty() {
         return Err(HttpParseError::MalformedHost);
-    }
-
-    if has_transfer_encoding && !content_length_values.is_empty() {
-        return Err(HttpParseError::ConflictingHeaders);
     }
 
     let mut content_length = 0;
@@ -311,6 +308,27 @@ pub fn parse_http_request_from_buf_with_limits(
     }))
 }
 
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -320,8 +338,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[derive(Debug, Clone)]
 pub enum BodySource {
     Bytes(Vec<u8>),
-    File(PathBuf, u64),
-    FileRange(PathBuf, u64, u64),
+    File(Arc<std::fs::File>, u64),
+    FileRange(Arc<std::fs::File>, u64, u64),
 }
 
 impl Default for BodySource {
@@ -364,18 +382,18 @@ impl HttpResponse {
         self
     }
 
-    pub fn with_file(mut self, path: PathBuf, file_size: u64, content_type: &str) -> Self {
+    pub fn with_file(mut self, file: std::fs::File, file_size: u64, content_type: &str) -> Self {
         self.headers
             .push(("Content-Length".to_string(), file_size.to_string()));
         self.headers
             .push(("Content-Type".to_string(), content_type.to_string()));
-        self.body_source = BodySource::File(path, file_size);
+        self.body_source = BodySource::File(Arc::new(file), file_size);
         self
     }
 
     pub fn with_file_range(
         mut self,
-        path: PathBuf,
+        file: std::fs::File,
         offset: u64,
         length: u64,
         content_type: &str,
@@ -384,7 +402,7 @@ impl HttpResponse {
             .push(("Content-Length".to_string(), length.to_string()));
         self.headers
             .push(("Content-Type".to_string(), content_type.to_string()));
-        self.body_source = BodySource::FileRange(path, offset, length);
+        self.body_source = BodySource::FileRange(Arc::new(file), offset, length);
         self
     }
 
@@ -438,35 +456,34 @@ impl HttpResponse {
                     stream.write_all(bytes)?;
                 }
             }
-            BodySource::File(path, _) => {
-                if let Ok(mut file) = std::fs::File::open(path) {
-                    let mut chunk = [0u8; 65536]; // Stack buffer 64KB
-                    while let Ok(n) = file.read(&mut chunk) {
-                        if n == 0 {
-                            break;
-                        }
-                        stream.write_all(&chunk[..n])?;
+            BodySource::File(file, _) => {
+                let mut file = file.try_clone()?;
+                let mut chunk = [0u8; 65536]; // Stack buffer 64KB
+                loop {
+                    let n = file.read(&mut chunk)?;
+                    if n == 0 {
+                        break;
                     }
+                    stream.write_all(&chunk[..n])?;
                 }
             }
-            BodySource::FileRange(path, offset, length) => {
-                if let Ok(mut file) = std::fs::File::open(path) {
-                    use std::io::Seek;
-                    if file.seek(std::io::SeekFrom::Start(*offset)).is_ok() {
-                        let mut remaining = *length;
-                        let mut chunk = [0u8; 65536];
-                        while remaining > 0 {
-                            let to_read = (remaining.min(chunk.len() as u64)) as usize;
-                            match file.read(&mut chunk[..to_read]) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    stream.write_all(&chunk[..n])?;
-                                    remaining -= n as u64;
-                                }
-                                Err(_) => break,
-                            }
-                        }
+            BodySource::FileRange(file, offset, length) => {
+                let mut file = file.try_clone()?;
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(*offset))?;
+                let mut remaining = *length;
+                let mut chunk = [0u8; 65536];
+                while remaining > 0 {
+                    let to_read = (remaining.min(chunk.len() as u64)) as usize;
+                    let n = file.read(&mut chunk[..to_read])?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "file changed while streaming response",
+                        ));
                     }
+                    stream.write_all(&chunk[..n])?;
+                    remaining -= n as u64;
                 }
             }
         }
@@ -569,5 +586,38 @@ mod tests {
             let mut buf = input.to_vec();
             let _ = parse_http_request_from_buf(&mut buf);
         }
+    }
+
+    #[test]
+    fn test_reject_whitespace_before_colon() {
+        let mut buf =
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length : 10\r\n\r\n1234567890".to_vec();
+        let err = parse_http_request_from_buf(&mut buf).unwrap_err();
+        assert_eq!(err, HttpParseError::MalformedRequest);
+    }
+
+    #[test]
+    fn test_reject_obs_fold_and_non_token_header_name() {
+        for request in [
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n Host: attacker\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nBad(Name): value\r\n\r\n".as_slice(),
+            b"GET\t/ HTTP/1.1\r\nHost: localhost\r\n\r\n".as_slice(),
+        ] {
+            let mut buf = request.to_vec();
+            assert_eq!(
+                parse_http_request_from_buf(&mut buf).unwrap_err(),
+                HttpParseError::MalformedRequest
+            );
+        }
+    }
+
+    #[test]
+    fn test_reject_all_transfer_encodings() {
+        let mut buf =
+            b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip\r\n\r\n".to_vec();
+        assert_eq!(
+            parse_http_request_from_buf(&mut buf).unwrap_err(),
+            HttpParseError::ChunkedEncodingNotImplemented
+        );
     }
 }

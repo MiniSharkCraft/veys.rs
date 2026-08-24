@@ -49,7 +49,7 @@ Designed for predictable memory usage, high reliability, and clear execution flo
 
 ## 🛡️ Security & Hardening
 
-`veysrs` v0.4.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities:
+`veysrs` v0.5.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities:
 
 - **Path Traversal Protection**: Double percent-decoding defense (`%252e%252e` → `%2e%2e` → `..`) combined with `fs::canonicalize()` validation against `ROOT_DIR`.
 - **Symlink Escape Protection**: Verifies that canonical file target paths remain strictly inside `canonical_root`.
@@ -166,12 +166,12 @@ veysrs/
 ├── Cargo.lock                 # Lockfile
 ├── README.md                  # Project documentation
 ├── docs/
-│   ├── v0.3-hardening.md      # v0.3.0 hardening specification
-│   └── v0.4-hardening.md      # v0.4.0 technical specification
+│   ├── v0.3-hardening.md      # v0.5.0 hardening specification
+│   └── v0.4-hardening.md      # v0.5.0 technical specification
 ├── public/
 │   └── index.html             # Default static web asset
 ├── release/
-│   └── veysrs-v0.3.0.tar.gz   # Release archive
+│   └── veysrs-v0.5.0.tar.gz   # Release archive
 └── src/
     ├── main.rs                # Entrypoint & CLI parser
     ├── config/                # .veysrule parser & inheritance manager
@@ -209,7 +209,7 @@ cargo test
 
 ## ⚠️ Current Limitations
 
-- **HTTP/2 and HTTP/3 Unimplemented**: v0.4.0 strictly focuses on HTTP/1.1. HTTP/2 is planned for v0.5+ and HTTP/3 + QUIC for v1.0+.
+- **HTTP/3 Unimplemented**: HTTP/3 + QUIC planned for v1.0+.
 - **No Native TLS/HTTPS**: Standard HTTP/1.1 plaintext only (use reverse proxies like Nginx/Caddy for SSL termination).
 - **Chunked Transfer-Encoding Unimplemented**: `Transfer-Encoding: chunked` requests return `501 Not Implemented`.
 
@@ -217,7 +217,7 @@ cargo test
 
 ## 🗺️ Roadmap
 
-- [ ] HTTP/2 support (planned for v0.5+).
+- [x] HTTP/2 multiplexing, HPACK, and flow control.
 - [ ] HTTP/3 + QUIC support (planned for v1.0+).
 - [ ] HTTPS / TLS support.
 - [ ] Enhanced access logging formats (JSON struct logs).

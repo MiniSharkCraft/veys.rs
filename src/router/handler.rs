@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use crate::config::{ConfigManager, ServerConfig};
-use crate::server::http::{HttpRequest, HttpResponse, Method, StatusCode};
+use crate::server::http::{BodySource, HttpRequest, HttpResponse, Method, StatusCode};
 
 pub struct RequestHandler<'a> {
     config: &'a ServerConfig,
@@ -107,8 +107,6 @@ impl<'a> RequestHandler<'a> {
             }
         }
 
-        let target_file_path = self.config.root_dir.join(&rel_path);
-
         let canonical_root = match fs::canonicalize(&self.config.root_dir) {
             Ok(r) => r,
             Err(_) => {
@@ -121,13 +119,13 @@ impl<'a> RequestHandler<'a> {
             }
         };
 
-        let mut actual_path = target_file_path;
-        if actual_path.is_dir() {
-            actual_path = actual_path.join("index.html");
-        }
-
-        let canonical_file = match fs::canonicalize(&actual_path) {
-            Ok(cp) => cp,
+        let open_path = if rel_path.as_os_str().is_empty() {
+            PathBuf::from("index.html")
+        } else {
+            rel_path.clone()
+        };
+        let (file, actual_path) = match open_beneath(&canonical_root, &open_path) {
+            Ok(v) => v,
             Err(_) => {
                 let mut resp = self.handle_404(&merged_config);
                 resp = apply_custom_headers(resp, &merged_config.headers);
@@ -135,102 +133,94 @@ impl<'a> RequestHandler<'a> {
                 return resp;
             }
         };
+        let mime_type = get_mime_type(&actual_path);
 
-        if !canonical_file.starts_with(&canonical_root) {
-            let mut resp = HttpResponse::new(StatusCode::Forbidden).with_body(
-                b"403 Forbidden: Target path outside root directory".to_vec(),
-                "text/plain; charset=utf-8",
-            );
-            resp = apply_custom_headers(resp, &merged_config.headers);
-            self.log_access(&peer_ip_str, req, &resp, start_time);
-            return resp;
-        }
+        let mut resp = {
+            let metadata = file.metadata().ok();
+            let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime_secs = mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
 
-        let mime_type = get_mime_type(&canonical_file);
+            let etag = generate_etag(mtime_secs, file_size);
+            let last_modified = format_http_date(mtime);
 
-        let mut resp = match File::open(&canonical_file) {
-            Ok(file) => {
-                let metadata = file.metadata().ok();
-                let file_size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                let mtime = metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let mtime_secs = mtime
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                let etag = generate_etag(mtime_secs, file_size);
-                let last_modified = format_http_date(mtime);
-
-                // Conditional Request Evaluation: If-None-Match & If-Modified-Since
-                let mut is_not_modified = false;
-                if let Some(if_none_match) = req.get_header("If-None-Match") {
-                    let client_etag = if_none_match.trim();
-                    if client_etag == "*" || client_etag == etag || client_etag.contains(&etag) {
+            // Conditional Request Evaluation: If-None-Match & If-Modified-Since
+            let mut is_not_modified = false;
+            if let Some(if_none_match) = req.get_header("If-None-Match") {
+                let client_etag = if_none_match.trim();
+                if client_etag == "*" || client_etag == etag || client_etag.contains(&etag) {
+                    is_not_modified = true;
+                }
+            } else if let Some(if_modified_since) = req.get_header("If-Modified-Since") {
+                if let Some(parsed_time) = parse_http_date(if_modified_since.trim()) {
+                    if mtime_secs <= parsed_time {
                         is_not_modified = true;
                     }
-                } else if let Some(if_modified_since) = req.get_header("If-Modified-Since") {
-                    if let Some(parsed_time) = parse_http_date(if_modified_since.trim()) {
-                        if mtime_secs <= parsed_time {
-                            is_not_modified = true;
-                        }
-                    }
-                }
-
-                if is_not_modified {
-                    HttpResponse::new(StatusCode::NotModified)
-                        .with_header("ETag", &etag)
-                        .with_header("Last-Modified", &last_modified)
-                } else if req.method == Method::Get && req.get_header("Range").is_some() {
-                    let range_str = req.get_header("Range").unwrap().trim();
-                    match parse_range_header(range_str, file_size) {
-                        Ok(Some(range)) => {
-                            let length = range.end - range.start + 1;
-                            let content_range =
-                                format!("bytes {}-{}/{}", range.start, range.end, file_size);
-                            HttpResponse::new(StatusCode::PartialContent)
-                                .with_header("ETag", &etag)
-                                .with_header("Last-Modified", &last_modified)
-                                .with_header("Content-Range", &content_range)
-                                .with_header("Accept-Ranges", "bytes")
-                                .with_file_range(canonical_file, range.start, length, mime_type)
-                        }
-                        Err(_) => {
-                            let content_range = format!("bytes */{}", file_size);
-                            HttpResponse::new(StatusCode::RangeNotSatisfiable)
-                                .with_header("Content-Range", &content_range)
-                                .with_body(
-                                    b"416 Range Not Satisfiable".to_vec(),
-                                    "text/plain; charset=utf-8",
-                                )
-                        }
-                        Ok(None) => HttpResponse::new(StatusCode::Ok)
-                            .with_header("ETag", &etag)
-                            .with_header("Last-Modified", &last_modified)
-                            .with_header("Accept-Ranges", "bytes")
-                            .with_file(canonical_file, file_size, mime_type),
-                    }
-                } else if req.method == Method::Head {
-                    HttpResponse::new(StatusCode::Ok)
-                        .with_header("Content-Length", &file_size.to_string())
-                        .with_header("Content-Type", mime_type)
-                        .with_header("ETag", &etag)
-                        .with_header("Last-Modified", &last_modified)
-                        .with_header("Accept-Ranges", "bytes")
-                } else {
-                    HttpResponse::new(StatusCode::Ok)
-                        .with_header("ETag", &etag)
-                        .with_header("Last-Modified", &last_modified)
-                        .with_header("Accept-Ranges", "bytes")
-                        .with_file(canonical_file, file_size, mime_type)
                 }
             }
-            Err(_) => self.handle_404(&merged_config),
+
+            if is_not_modified {
+                HttpResponse::new(StatusCode::NotModified)
+                    .with_header("ETag", &etag)
+                    .with_header("Last-Modified", &last_modified)
+            } else if req.method == Method::Get && req.get_header("Range").is_some() {
+                let range_str = req.get_header("Range").unwrap().trim();
+                match parse_range_header(range_str, file_size) {
+                    Ok(Some(range)) => {
+                        let length = range.end - range.start + 1;
+                        let content_range =
+                            format!("bytes {}-{}/{}", range.start, range.end, file_size);
+                        HttpResponse::new(StatusCode::PartialContent)
+                            .with_header("ETag", &etag)
+                            .with_header("Last-Modified", &last_modified)
+                            .with_header("Content-Range", &content_range)
+                            .with_header("Accept-Ranges", "bytes")
+                            .with_file_range(file, range.start, length, mime_type)
+                    }
+                    Err(_) => {
+                        let content_range = format!("bytes */{}", file_size);
+                        HttpResponse::new(StatusCode::RangeNotSatisfiable)
+                            .with_header("Content-Range", &content_range)
+                            .with_body(
+                                b"416 Range Not Satisfiable".to_vec(),
+                                "text/plain; charset=utf-8",
+                            )
+                    }
+                    Ok(None) => HttpResponse::new(StatusCode::Ok)
+                        .with_header("ETag", &etag)
+                        .with_header("Last-Modified", &last_modified)
+                        .with_header("Accept-Ranges", "bytes")
+                        .with_file(file, file_size, mime_type),
+                }
+            } else if req.method == Method::Head {
+                HttpResponse::new(StatusCode::Ok)
+                    .with_header("Content-Length", &file_size.to_string())
+                    .with_header("Content-Type", mime_type)
+                    .with_header("ETag", &etag)
+                    .with_header("Last-Modified", &last_modified)
+                    .with_header("Accept-Ranges", "bytes")
+            } else {
+                HttpResponse::new(StatusCode::Ok)
+                    .with_header("ETag", &etag)
+                    .with_header("Last-Modified", &last_modified)
+                    .with_header("Accept-Ranges", "bytes")
+                    .with_file(file, file_size, mime_type)
+            }
         };
 
         resp = apply_custom_headers(resp, &merged_config.headers);
+
+        // Enforce HEAD semantics: strip body regardless of status code
+        if req.method == Method::Head {
+            resp.body_source = BodySource::Bytes(Vec::new());
+        }
+
         self.log_access(&peer_ip_str, req, &resp, start_time);
         resp
     }
@@ -277,6 +267,72 @@ impl<'a> RequestHandler<'a> {
             duration_ms
         );
     }
+}
+
+#[cfg(unix)]
+fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const O_CLOEXEC: i32 = 0x80000;
+    const O_DIRECTORY: i32 = 0x10000;
+    const O_NOFOLLOW: i32 = 0x20000;
+    const O_RDONLY: i32 = 0;
+
+    unsafe extern "C" {
+        fn openat(dirfd: RawFd, path: *const i8, flags: i32, mode: i32) -> i32;
+    }
+
+    let root_file = File::open(root)?;
+    let mut directories = vec![root_file];
+    let components: Vec<_> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.as_bytes().to_vec()),
+            _ => None,
+        })
+        .collect();
+    if components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "empty path",
+        ));
+    }
+
+    let mut current_fd = directories[0].as_raw_fd();
+    for (index, component) in components.iter().enumerate() {
+        let name = CString::new(component.as_slice())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+        let last = index + 1 == components.len();
+        let flags = if last {
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        } else {
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY
+        };
+        let fd = unsafe { openat(current_fd, name.as_ptr(), flags, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if last {
+            if file.metadata()?.is_dir() {
+                let mut index_path = relative.to_path_buf();
+                index_path.push("index.html");
+                return open_beneath(root, &index_path);
+            }
+            return Ok((file, root.join(relative)));
+        }
+        current_fd = file.as_raw_fd();
+        directories.push(file);
+    }
+    unreachable!()
+}
+
+#[cfg(not(unix))]
+fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)> {
+    let path = root.join(relative);
+    Ok((File::open(&path)?, path))
 }
 
 fn apply_custom_headers(mut resp: HttpResponse, headers: &[(String, String)]) -> HttpResponse {
@@ -705,5 +761,22 @@ mod tests {
         assert_eq!(get_mime_type(Path::new("feed.xml")), "application/xml");
         assert_eq!(get_mime_type(Path::new("image.webp")), "image/webp");
         assert_eq!(get_mime_type(Path::new("module.wasm")), "application/wasm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_static_open_rejects_final_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("veysrs-nofollow-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("target.txt");
+        let link = dir.join("link.txt");
+        fs::write(&target, b"outside target").unwrap();
+        let _ = fs::remove_file(&link);
+        symlink(&target, &link).unwrap();
+        assert!(open_beneath(&dir, Path::new("link.txt")).is_err());
+        let _ = fs::remove_file(&link);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir(&dir);
     }
 }

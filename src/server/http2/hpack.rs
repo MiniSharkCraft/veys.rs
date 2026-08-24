@@ -11,7 +11,7 @@ pub const STATIC_TABLE: &[(&str, &str)] = &[
     (":scheme", "https"),
     (":status", "200"),
     (":status", "204"),
-    (":status", "26"),
+    (":status", "206"),
     (":status", "304"),
     (":status", "400"),
     (":status", "404"),
@@ -120,6 +120,7 @@ impl DynamicTable {
 /// HPACK Decoder
 pub struct HpackDecoder {
     dynamic_table: DynamicTable,
+    max_dynamic_table_size: usize,
     max_header_block_size: usize,
 }
 
@@ -127,6 +128,7 @@ impl HpackDecoder {
     pub fn new(max_dynamic_table_size: usize, max_header_block_size: usize) -> Self {
         Self {
             dynamic_table: DynamicTable::new(max_dynamic_table_size),
+            max_dynamic_table_size,
             max_header_block_size,
         }
     }
@@ -174,7 +176,12 @@ impl HpackDecoder {
                 // 3. Dynamic Table Size Update (001xxxxx)
                 let (new_max, bytes_read) = decode_int(&buf[pos..], 5)?;
                 pos += bytes_read;
-                self.dynamic_table.set_max_size(new_max as usize);
+                let new_max =
+                    usize::try_from(new_max).map_err(|_| Http2ErrorCode::CompressionError)?;
+                if new_max > self.max_dynamic_table_size {
+                    return Err(Http2ErrorCode::CompressionError);
+                }
+                self.dynamic_table.set_max_size(new_max);
             } else {
                 // 4. Literal Header Field without / never Indexing (0000xxxx / 0001xxxx)
                 let (idx, bytes_read) = decode_int(&buf[pos..], 4)?;
@@ -288,13 +295,21 @@ pub fn decode_int(buf: &[u8], prefix_bits: usize) -> Result<(u64, usize), Http2E
 
     while pos < buf.len() {
         let b = buf[pos] as u64;
-        val += (b & 0x7F) << m;
-        m += 7;
+        let chunk = b & 0x7F;
 
-        if m >= 64 {
+        // Prevent shift overflow (m >= 64 would panic checked_shl, and shifting by > 63 overflows u64 anyway)
+        if m >= 63 {
             return Err(Http2ErrorCode::CompressionError);
         }
 
+        let shift_val = chunk
+            .checked_shl(m)
+            .ok_or(Http2ErrorCode::CompressionError)?;
+        val = val
+            .checked_add(shift_val)
+            .ok_or(Http2ErrorCode::CompressionError)?;
+
+        m += 7;
         pos += 1;
         if (b & 0x80) == 0 {
             return Ok((val, pos));
@@ -330,7 +345,12 @@ fn decode_string(buf: &[u8]) -> Result<(String, usize), Http2ErrorCode> {
     let is_huffman = (buf[0] & 0x80) != 0;
     let (str_len, bytes_read) = decode_int(buf, 7)?;
 
-    let total_len = bytes_read + str_len as usize;
+    // Safe length calculation preventing usize overflow panics
+    let usize_str_len = usize::try_from(str_len).map_err(|_| Http2ErrorCode::CompressionError)?;
+    let total_len = bytes_read
+        .checked_add(usize_str_len)
+        .ok_or(Http2ErrorCode::CompressionError)?;
+
     if buf.len() < total_len {
         return Err(Http2ErrorCode::CompressionError);
     }
@@ -398,6 +418,8 @@ fn decode_huffman(bytes: &[u8]) -> Result<String, Http2ErrorCode> {
 
     let mut decoded = Vec::new();
     let mut curr = 0;
+    let mut bits_since_symbol = 0;
+    let mut trailing_bits_are_ones = true;
 
     for &byte in bytes {
         for bit_idx in (0..8).rev() {
@@ -411,6 +433,8 @@ fn decode_huffman(bytes: &[u8]) -> Result<String, Http2ErrorCode> {
             match next {
                 Some(idx) => {
                     curr = idx;
+                    bits_since_symbol += 1;
+                    trailing_bits_are_ones &= bit == 1;
                     if let Some(sym) = nodes[curr].symbol {
                         if sym == 256 {
                             // EOS Symbol
@@ -418,17 +442,18 @@ fn decode_huffman(bytes: &[u8]) -> Result<String, Http2ErrorCode> {
                         }
                         decoded.push(sym as u8);
                         curr = 0; // Trở về gốc cây
+                        bits_since_symbol = 0;
+                        trailing_bits_are_ones = true;
                     }
                 }
-                None => {
-                    if !decoded.is_empty() {
-                        return String::from_utf8(decoded)
-                            .map_err(|_| Http2ErrorCode::CompressionError);
-                    }
-                    return Err(Http2ErrorCode::CompressionError);
-                }
+                None => return Err(Http2ErrorCode::CompressionError),
             }
         }
+    }
+
+    // RFC 7541 only permits up to seven one-bits of EOS-prefix padding.
+    if curr != 0 && (bits_since_symbol > 7 || !trailing_bits_are_ones) {
+        return Err(Http2ErrorCode::CompressionError);
     }
 
     String::from_utf8(decoded).map_err(|_| Http2ErrorCode::CompressionError)
@@ -694,3 +719,60 @@ const HUFFMAN_SPEC: &[(u16, u32, u8)] = &[
     (255, 0x3ffffee, 26),
     (256, 0x3fffffff, 30),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_int_bounds() {
+        // Safe integer decoding
+        let buf = [0xFF, 0x01]; // prefix 0xFF (mask 127) -> 127 + 1 = 128
+        let (val, len) = decode_int(&buf, 7).unwrap();
+        assert_eq!(val, 128);
+        assert_eq!(len, 2);
+
+        // Malicious integer decoding (shift > 63)
+        // 0x7F + 0x80 (128) shifted repeatedly
+        let mut mal_buf = vec![0xFF];
+        mal_buf.extend(std::iter::repeat_n(0xFF, 15)); // 15 * 7 = 105 shift
+        mal_buf.push(0x01);
+        let res = decode_int(&mal_buf, 7);
+        assert_eq!(res, Err(Http2ErrorCode::CompressionError));
+    }
+
+    #[test]
+    fn test_hpack_decode_string_boundary() {
+        // String with declared length that overflows usize
+        // e.g. length = u64::MAX
+        let mut buf = vec![0x00]; // 0000000 (length starts here)
+        buf[0] = 0x7F; // max prefix
+        buf.extend(std::iter::repeat_n(0xFF, 9));
+        buf.push(0x01); // terminates integer with high value
+        let res = decode_string(&buf);
+        assert_eq!(res, Err(Http2ErrorCode::CompressionError));
+    }
+
+    #[test]
+    fn test_huffman_and_static_status_206() {
+        // RFC 7541 C.4.1: "www.example.com" Huffman-coded.
+        assert_eq!(
+            decode_huffman(&[
+                0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff
+            ])
+            .unwrap(),
+            "www.example.com"
+        );
+        assert_eq!(STATIC_TABLE[9], (":status", "206"));
+    }
+
+    #[test]
+    fn test_reject_oversized_dynamic_table_update() {
+        let mut decoder = HpackDecoder::new(4096, 1024);
+        // Dynamic table size update to 4097 (00111111, then 0xE2 0x1F).
+        assert_eq!(
+            decoder.decode_header_block(&[0x3f, 0xe2, 0x1f]),
+            Err(Http2ErrorCode::CompressionError)
+        );
+    }
+}

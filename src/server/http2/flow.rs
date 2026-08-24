@@ -1,6 +1,5 @@
 use crate::server::http2::frame::Http2ErrorCode;
 
-pub const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65_535;
 pub const MAX_WINDOW_SIZE: u32 = 2_147_483_647; // 2^31 - 1
 
 /// Struct quản lý một Sliding Flow-Control Window (RFC 9113 Section 5.2)
@@ -38,7 +37,19 @@ impl Window {
 
     /// Trừ dung lượng cửa sổ khi gửi/nhận DATA frame
     pub fn consume(&mut self, bytes: u32) -> Result<(), Http2ErrorCode> {
+        if bytes as i64 > self.available as i64 {
+            return Err(Http2ErrorCode::FlowControlError);
+        }
         self.available -= bytes as i32;
+        Ok(())
+    }
+
+    pub fn adjust(&mut self, delta: i64) -> Result<(), Http2ErrorCode> {
+        let updated = self.available as i64 + delta;
+        if updated > MAX_WINDOW_SIZE as i64 || updated < i32::MIN as i64 {
+            return Err(Http2ErrorCode::FlowControlError);
+        }
+        self.available = updated as i32;
         Ok(())
     }
 }
