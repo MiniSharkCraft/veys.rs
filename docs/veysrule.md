@@ -42,6 +42,23 @@ mime ".wasm" "application/wasm"
 error_page 404 "/404.html"
 ```
 
+For Laravel-style applications, configure a trusted FastCGI endpoint and a
+front controller in the root rule file:
+
+```text
+FASTCGI = * /index.php unix:/run/php/php8.5-fpm.sock /var/www/reviactyl/public
+FRONT_CONTROLLER = /index.php
+```
+
+`FRONT_CONTROLLER` is only considered after the request has been normalized
+and no static file or directory (including `index.html`/`index.htm`) matches.
+The matching `FASTCGI` route supplies the endpoint and document root. The
+original `REQUEST_URI` and query string are preserved while
+`SCRIPT_FILENAME`/`SCRIPT_NAME` point to the configured controller. Direct
+`/index.php` requests still use the explicit FastCGI route. If the directive
+is omitted, missing paths remain normal 404 responses. PHP files are never
+served through this fallback unless a matching FastCGI route is configured.
+
 Supported durations are `s`, `m`, `h`, `d`, and `w`. Status codes must be
 between 100 and 599, CIDRs must have a valid prefix, and response header values
 cannot contain CR/LF. Rule files are limited to 256 KiB and rewrite rules to
@@ -59,7 +76,7 @@ opened component-by-component with `openat(O_NOFOLLOW)` on Unix, so validation
 and opening share one fd-based boundary.
 
 Rewrites are parsed, validated, and bounded for forward compatibility, but are
-not applied to requests in v0.6.0. Directory auto-index generation and custom
+not applied to requests in v0.6.1. Directory auto-index generation and custom
 error pages are implemented with bounded enumeration/file reads and the same
 document-root boundary as static files.
 

@@ -91,6 +91,9 @@ pub struct ServerConfig {
     pub proxy_routes: Vec<ProxyRoute>,
     /// Trusted, root-file-only FastCGI routes.
     pub fastcgi_routes: Vec<FastCgiRoute>,
+    /// Optional Laravel-style front controller used when no static resource
+    /// matches the request. The matching FASTCGI route supplies the endpoint.
+    pub front_controller: Option<String>,
     pub log_format: String,
     pub access_log: String,
     pub error_log: String,
@@ -166,6 +169,7 @@ impl Default for ServerConfig {
             vhosts: Vec::new(),
             proxy_routes: Vec::new(),
             fastcgi_routes: Vec::new(),
+            front_controller: None,
             log_format: "text".to_string(),
             access_log: "stdout".to_string(),
             error_log: "stderr".to_string(),
@@ -460,6 +464,19 @@ fn valid_header_name(name: &str) -> bool {
 
 fn valid_header_value(value: &str) -> bool {
     !value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
+fn valid_front_controller_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value.len() > 1
+        && !value
+            .bytes()
+            .any(|b| b == b'\r' || b == b'\n' || b == 0 || b == b'?' || b == b'#' || b == b'%')
+        && value
+            .split('/')
+            .skip(1)
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+        && !value.ends_with('/')
 }
 
 fn parse_cidr(value: &str) -> Result<Cidr, String> {
@@ -1395,6 +1412,23 @@ pub fn parse_veysrule_content(
                     }
                 }
             }
+            "FRONT_CONTROLLER" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "FRONT_CONTROLLER is a root-only directive".to_string(),
+                    });
+                } else if !valid_front_controller_path(val) {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "FRONT_CONTROLLER must be a safe absolute URL path".to_string(),
+                    });
+                } else {
+                    server_config.front_controller = Some(val.to_string());
+                }
+            }
             "DENY_HIDDEN_FILES" => match val.to_lowercase().as_str() {
                 "true" | "1" | "yes" => {
                     dir_config.deny_hidden_files = Some(true);
@@ -2032,6 +2066,25 @@ MAX_CONNECTIONS = 9999
 
         let (_, _, errors) =
             parse_veysrule_content("PROXY = * / http://127.0.0.1:1\n", "child/.veysrule", false);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("root-only"));
+    }
+
+    #[test]
+    fn test_front_controller_is_root_only_and_path_validated() {
+        let (config, _, errors) =
+            parse_veysrule_content("FRONT_CONTROLLER = /index.php\n", ".veysrule", true);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(config.front_controller.as_deref(), Some("/index.php"));
+
+        for value in ["../index.php", "/../index.php", "/index.php?x=1", "/"] {
+            let (_, _, errors) =
+                parse_veysrule_content(&format!("FRONT_CONTROLLER = {value}\n"), ".veysrule", true);
+            assert_eq!(errors.len(), 1, "accepted unsafe controller {value}");
+        }
+
+        let (_, _, errors) =
+            parse_veysrule_content("FRONT_CONTROLLER = /index.php\n", "nested/.veysrule", false);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("root-only"));
     }

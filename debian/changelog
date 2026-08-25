@@ -1,3 +1,9 @@
+veysrs (0.6.1-1) unstable; urgency=medium
+
+  * Add native Laravel/Reviactyl front-controller fallback for FastCGI.
+
+ -- VeySRS Maintainers <maintainers@example.invalid>  Tue, 25 Aug 2026 00:00:00 +0000
+
 veysrs (0.6.0-1) unstable; urgency=medium
 
   * Release VeySRS 0.6.0 with hardened HTTP/1.1 and HTTP/2 handling,

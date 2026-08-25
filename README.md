@@ -1,10 +1,10 @@
 # VeySRS
 
-VeySRS 0.6.0 is a bounded, blocking Rust web server for HTTP/1.1 and HTTP/2.
+VeySRS 0.6.1 is a bounded, blocking Rust web server for HTTP/1.1 and HTTP/2.
 It uses a fixed thread pool and ordinary TCP sockets; it does not use Tokio or
 another async runtime. TLS and gzip are provided by focused Rust crates.
 
-The v0.6.0 scope is feature-complete for the current architecture. HTTP/3 and
+The v0.6.1 scope is feature-complete for the current architecture. HTTP/3 and
 QUIC are explicitly deferred to a post-v1.0 roadmap.
 
 ## Capabilities
@@ -95,6 +95,7 @@ Trusted proxy/FastCGI routes are root-only:
 ```text
 PROXY = example.com /api/ http://127.0.0.1:3000
 FASTCGI = panel.example.com / unix:/run/php/php-fpm.sock /var/lib/veysrs/www/panel
+FRONT_CONTROLLER = /index.php
 ```
 
 See [docs/tls-vhosts.md](docs/tls-vhosts.md) and
@@ -164,7 +165,7 @@ The current local tree passes the complete Rust matrix; external VPS,
 Docker-runtime, cargo-fuzz, and cross-server benchmark evidence is not claimed
 by this repository release and remains deployment-specific work.
 
-VeySRS 0.6.0 is the current feature-complete release for HTTP/1.1 and HTTP/2.
+VeySRS 0.6.1 is the current feature-complete release for HTTP/1.1 and HTTP/2.
 HTTP/3 and QUIC are **post-v1.0 / deferred**.
 
 ## License

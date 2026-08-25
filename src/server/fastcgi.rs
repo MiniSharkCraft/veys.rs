@@ -52,19 +52,7 @@ pub fn handle<S: Read + Write>(
     secure: bool,
     peer: SocketAddr,
 ) -> io::Result<Option<bool>> {
-    let host = req
-        .get_header("Host")
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let Some(route) = config
-        .fastcgi_routes
-        .iter()
-        .filter(|r| (r.host == "*" || r.host == host) && req.uri.starts_with(&r.prefix))
-        .max_by_key(|r| r.prefix.len())
-    else {
+    let Some((route, script_uri)) = select_route(req, config) else {
         return Ok(None);
     };
     crate::server::metrics::record_fastcgi();
@@ -91,10 +79,18 @@ pub fn handle<S: Read + Write>(
         )?;
         return Ok(Some(true));
     }
-    let script = script_path(route, req)?;
+    let script = script_path_for_uri(route, req, script_uri)?;
     let mut upstream = connect(route, config.write_timeout.max(1))?;
     send_begin(&mut upstream)?;
-    let params = build_params(req, route, &script, secure, peer, req.body.len());
+    let params = build_params(
+        req,
+        route,
+        &script,
+        script_uri,
+        secure,
+        peer,
+        req.body.len(),
+    );
     send_records(&mut upstream, PARAMS, &params)?;
     send_records(&mut upstream, STDIN, &req.body)?;
     send_record(&mut upstream, STDIN, &[])?;
@@ -115,6 +111,18 @@ pub fn handle<S: Read + Write>(
 }
 
 pub fn route_matches_request(req: &HttpRequest, config: &ServerConfig) -> bool {
+    select_route(req, config).is_some()
+}
+
+fn select_route<'a>(
+    req: &HttpRequest,
+    config: &'a ServerConfig,
+) -> Option<(&'a FastCgiRoute, Option<&'a str>)> {
+    // Protected/invalid paths must never be handed to PHP-FPM, including when
+    // an explicit catch-all FastCGI route is configured.
+    if !crate::router::handler::request_path_is_safe(req, config) {
+        return None;
+    }
     let host = req
         .get_header("Host")
         .unwrap_or("")
@@ -122,9 +130,31 @@ pub fn route_matches_request(req: &HttpRequest, config: &ServerConfig) -> bool {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    config.fastcgi_routes.iter().any(|route| {
-        (route.host == "*" || route.host == host) && req.uri.starts_with(&route.prefix)
-    })
+    if let Some(route) = config
+        .fastcgi_routes
+        .iter()
+        .filter(|route| {
+            (route.host == "*" || route.host == host) && req.uri.starts_with(&route.prefix)
+        })
+        .max_by_key(|route| route.prefix.len())
+    {
+        return Some((route, None));
+    }
+
+    let controller = config.front_controller.as_deref()?;
+    let request_path = req.uri.split('?').next().unwrap_or("");
+    if request_path == "/metrics" || crate::router::handler::request_has_static_target(req, config)
+    {
+        return None;
+    }
+    let route = config
+        .fastcgi_routes
+        .iter()
+        .filter(|route| {
+            (route.host == "*" || route.host == host) && controller.starts_with(&route.prefix)
+        })
+        .max_by_key(|route| route.prefix.len())?;
+    Some((route, Some(controller)))
 }
 
 pub fn handle_streaming_body<S: Read + Write>(
@@ -136,21 +166,7 @@ pub fn handle_streaming_body<S: Read + Write>(
     peer: SocketAddr,
 ) -> io::Result<Option<bool>> {
     let request = head.clone().into_request(Vec::new());
-    let host = request
-        .get_header("Host")
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let Some(route) = config
-        .fastcgi_routes
-        .iter()
-        .filter(|route| {
-            (route.host == "*" || route.host == host) && request.uri.starts_with(&route.prefix)
-        })
-        .max_by_key(|route| route.prefix.len())
-    else {
+    let Some((route, script_uri)) = select_route(&request, config) else {
         return Ok(None);
     };
     if !matches!(request.method, crate::server::http::Method::Post) {
@@ -166,10 +182,18 @@ pub fn handle_streaming_body<S: Read + Write>(
         )?;
         return Ok(Some(true));
     }
-    let script = script_path(route, &request)?;
+    let script = script_path_for_uri(route, &request, script_uri)?;
     let mut upstream = connect(route, config.write_timeout.max(1))?;
     send_begin(&mut upstream)?;
-    let params = build_params(&request, route, &script, secure, peer, head.content_length);
+    let params = build_params(
+        &request,
+        route,
+        &script,
+        script_uri,
+        secure,
+        peer,
+        head.content_length,
+    );
     send_records(&mut upstream, PARAMS, &params)?;
     send_record(&mut upstream, PARAMS, &[])?;
     let mut remaining = head.content_length;
@@ -219,16 +243,7 @@ pub fn fetch_response(
     secure: bool,
     peer: SocketAddr,
 ) -> io::Result<Option<HttpResponse>> {
-    let host = req
-        .get_header("Host")
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !config.fastcgi_routes.iter().any(|route| {
-        (route.host == "*" || route.host == host) && req.uri.starts_with(&route.prefix)
-    }) {
+    if !route_matches_request(req, config) {
         return Ok(None);
     }
     let mut capture = crate::server::proxy::ResponseCapture::new();
@@ -537,21 +552,7 @@ pub(crate) fn begin_h2_response(
     secure: bool,
     peer: SocketAddr,
 ) -> io::Result<Option<H2FastCgiPending>> {
-    let host = req
-        .get_header("Host")
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let Some(route) = config
-        .fastcgi_routes
-        .iter()
-        .filter(|route| {
-            (route.host == "*" || route.host == host) && req.uri.starts_with(&route.prefix)
-        })
-        .max_by_key(|route| route.prefix.len())
-    else {
+    let Some((route, script_uri)) = select_route(req, config) else {
         return Ok(None);
     };
     if !matches!(
@@ -570,11 +571,19 @@ pub(crate) fn begin_h2_response(
             "FastCGI document root outside vhost root",
         ));
     }
-    let script = script_path(route, req)?;
+    let script = script_path_for_uri(route, req, script_uri)?;
     let permit = crate::server::proxy::acquire_upstream_permit()?;
     let mut upstream = connect(route, config.write_timeout.max(1))?;
     send_begin(&mut *upstream)?;
-    let params = build_params(req, route, &script, secure, peer, req.body.len());
+    let params = build_params(
+        req,
+        route,
+        &script,
+        script_uri,
+        secure,
+        peer,
+        req.body.len(),
+    );
     send_records(&mut *upstream, PARAMS, &params)?;
     send_record(&mut *upstream, PARAMS, &[])?;
     send_records(&mut *upstream, STDIN, &req.body)?;
@@ -606,21 +615,7 @@ pub(crate) fn open_h2_response(
     secure: bool,
     peer: SocketAddr,
 ) -> io::Result<Option<H2Response>> {
-    let host = req
-        .get_header("Host")
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let Some(route) = config
-        .fastcgi_routes
-        .iter()
-        .filter(|route| {
-            (route.host == "*" || route.host == host) && req.uri.starts_with(&route.prefix)
-        })
-        .max_by_key(|route| route.prefix.len())
-    else {
+    let Some((route, script_uri)) = select_route(req, config) else {
         return Ok(None);
     };
     if !matches!(
@@ -639,10 +634,18 @@ pub(crate) fn open_h2_response(
             "FastCGI document root outside vhost root",
         ));
     }
-    let script = script_path(route, req)?;
+    let script = script_path_for_uri(route, req, script_uri)?;
     let mut upstream = connect(route, config.write_timeout.max(1))?;
     send_begin(&mut *upstream)?;
-    let params = build_params(req, route, &script, secure, peer, req.body.len());
+    let params = build_params(
+        req,
+        route,
+        &script,
+        script_uri,
+        secure,
+        peer,
+        req.body.len(),
+    );
     send_records(&mut *upstream, PARAMS, &params)?;
     send_record(&mut *upstream, PARAMS, &[])?;
     send_records(&mut *upstream, STDIN, &req.body)?;
@@ -782,8 +785,17 @@ fn connect(route: &FastCgiRoute, timeout_secs: u64) -> io::Result<Box<dyn FastCg
     ))
 }
 
+#[cfg(test)]
 fn script_path(route: &FastCgiRoute, req: &HttpRequest) -> io::Result<PathBuf> {
-    let raw = req.uri.split('?').next().unwrap_or("/");
+    script_path_for_uri(route, req, None)
+}
+
+fn script_path_for_uri(
+    route: &FastCgiRoute,
+    req: &HttpRequest,
+    script_uri: Option<&str>,
+) -> io::Result<PathBuf> {
+    let raw = script_uri.unwrap_or_else(|| req.uri.split('?').next().unwrap_or("/"));
     let decoded = percent_decode(raw)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid request path"))?;
     let relative = decoded.trim_start_matches('/');
@@ -811,11 +823,12 @@ fn build_params(
     req: &HttpRequest,
     route: &FastCgiRoute,
     script: &Path,
+    script_uri: Option<&str>,
     secure: bool,
     peer: SocketAddr,
     body_length: usize,
 ) -> Vec<u8> {
-    let path = req.uri.split('?').next().unwrap_or("/");
+    let path = script_uri.unwrap_or_else(|| req.uri.split('?').next().unwrap_or("/"));
     let query = req.uri.split_once('?').map(|(_, q)| q).unwrap_or("");
     let host = req.get_header("Host").unwrap_or("");
     let mut params = Vec::new();
@@ -1203,6 +1216,7 @@ fn percent_decode(input: &str) -> Option<String> {
 mod tests {
     use super::*;
     use flate2::read::GzDecoder;
+    use std::net::TcpListener;
 
     #[test]
     fn encodes_short_and_long_parameter_lengths() {
@@ -1292,6 +1306,259 @@ mod tests {
             body: Vec::new(),
         };
         assert!(script_path(&route, &req).is_err());
+    }
+
+    #[test]
+    fn front_controller_selects_only_missing_resources_and_preserves_query() {
+        let base = std::env::temp_dir().join(format!(
+            "veysrs-front-controller-fcgi-{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("css")).unwrap();
+        std::fs::write(root.join("index.php"), b"<?php").unwrap();
+        std::fs::write(root.join("css/app.css"), b"body{}").unwrap();
+
+        let route = FastCgiRoute {
+            host: "*".to_string(),
+            prefix: "/index.php".to_string(),
+            endpoint: "unix:/tmp/php.sock".to_string(),
+            document_root: root.clone(),
+        };
+        let mut config = ServerConfig {
+            root_dir: root.clone(),
+            front_controller: Some("/index.php".to_string()),
+            ..ServerConfig::default()
+        };
+        config.fastcgi_routes.push(route.clone());
+        let request = |method: crate::server::http::Method, uri: &str| HttpRequest {
+            method,
+            uri: uri.to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "example.test".to_string())],
+            body: Vec::new(),
+        };
+
+        let missing = request(crate::server::http::Method::Get, "/login?foo=bar");
+        let (selected, script_uri) = select_route(&missing, &config).expect("fallback route");
+        assert_eq!(selected.prefix, "/index.php");
+        assert_eq!(script_uri, Some("/index.php"));
+        let script = script_path_for_uri(selected, &missing, script_uri).unwrap();
+        assert_eq!(script, root.join("index.php"));
+        let params = build_params(
+            &missing,
+            selected,
+            &script,
+            script_uri,
+            false,
+            "127.0.0.1:1234".parse().unwrap(),
+            0,
+        );
+        assert!(params.windows(b"foo=bar".len()).any(|w| w == b"foo=bar"));
+        assert!(params
+            .windows(b"/login?foo=bar".len())
+            .any(|w| w == b"/login?foo=bar"));
+        assert!(params
+            .windows(b"/index.php".len())
+            .any(|w| w == b"/index.php"));
+
+        // Existing files and directories stay on static handling.
+        assert!(select_route(
+            &request(crate::server::http::Method::Get, "/css/app.css"),
+            &config
+        )
+        .is_none());
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        assert!(select_route(
+            &request(crate::server::http::Method::Get, "/docs/"),
+            &config
+        )
+        .is_none());
+
+        // Direct /index.php is an explicit FastCGI route, not a fallback.
+        let (_, direct_script_uri) = select_route(
+            &request(crate::server::http::Method::Get, "/index.php"),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(direct_script_uri, None);
+
+        // POST is routed as well; request-body streaming remains the caller's job.
+        assert!(select_route(
+            &request(crate::server::http::Method::Post, "/api/foo"),
+            &config
+        )
+        .is_some());
+        assert!(select_route(
+            &request(crate::server::http::Method::Get, "/%2e%2e/etc/passwd"),
+            &config
+        )
+        .is_none());
+
+        config.front_controller = None;
+        assert!(select_route(&missing, &config).is_none());
+        config.fastcgi_routes[0].prefix = "/".to_string();
+        assert!(select_route(
+            &request(crate::server::http::Method::Get, "/.veysrule"),
+            &config
+        )
+        .is_none());
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn h1_front_controller_reaches_fastcgi_and_keeps_original_request_uri() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base = std::env::temp_dir().join(format!(
+            "veysrs-front-controller-live-{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.php"), b"<?php").unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut upstream, _) = listener.accept().unwrap();
+            let mut params = Vec::new();
+            loop {
+                let mut header = [0u8; 8];
+                upstream.read_exact(&mut header).unwrap();
+                let kind = header[1];
+                let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+                let padding = header[6] as usize;
+                let mut data = vec![0u8; length];
+                upstream.read_exact(&mut data).unwrap();
+                if padding > 0 {
+                    let mut ignored = vec![0u8; padding];
+                    upstream.read_exact(&mut ignored).unwrap();
+                }
+                if kind == PARAMS {
+                    params.extend_from_slice(&data);
+                }
+                if kind == STDIN && length == 0 {
+                    break;
+                }
+            }
+            let mut record = |kind: u8, data: &[u8]| {
+                let mut header = [0u8; 8];
+                header[0] = FCGI_VERSION;
+                header[1] = kind;
+                header[2..4].copy_from_slice(&1u16.to_be_bytes());
+                header[4..6].copy_from_slice(&(data.len() as u16).to_be_bytes());
+                upstream.write_all(&header).unwrap();
+                upstream.write_all(data).unwrap();
+            };
+            record(
+                STDOUT,
+                b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nfront",
+            );
+            record(END_REQUEST, &[0; 8]);
+            params
+        });
+
+        let mut config = ServerConfig {
+            root_dir: root.clone(),
+            front_controller: Some("/index.php".to_string()),
+            ..ServerConfig::default()
+        };
+        config.fastcgi_routes.push(FastCgiRoute {
+            host: "*".to_string(),
+            prefix: "/index.php".to_string(),
+            endpoint: format!("tcp://{address}"),
+            document_root: root,
+        });
+        let request = HttpRequest {
+            method: crate::server::http::Method::Get,
+            uri: "/login?foo=bar".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "example.test".to_string())],
+            body: Vec::new(),
+        };
+        let response = fetch_response(&request, &config, false, "127.0.0.1:12345".parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, StatusCode::Ok);
+        let params = server.join().unwrap();
+        assert!(params.windows(b"foo=bar".len()).any(|w| w == b"foo=bar"));
+        assert!(params
+            .windows(b"/login?foo=bar".len())
+            .any(|w| w == b"/login?foo=bar"));
+        assert!(params
+            .windows(b"/index.php".len())
+            .any(|w| w == b"/index.php"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn h2_front_controller_uses_controller_script() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let base =
+            std::env::temp_dir().join(format!("veysrs-front-controller-h2-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.php"), b"<?php").unwrap();
+
+        let server = std::thread::spawn(move || {
+            let (mut upstream, _) = listener.accept().unwrap();
+            loop {
+                let mut header = [0u8; 8];
+                upstream.read_exact(&mut header).unwrap();
+                let kind = header[1];
+                let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+                let padding = header[6] as usize;
+                let mut data = vec![0u8; length];
+                upstream.read_exact(&mut data).unwrap();
+                if padding > 0 {
+                    let mut ignored = vec![0u8; padding];
+                    upstream.read_exact(&mut ignored).unwrap();
+                }
+                if kind == STDIN && length == 0 {
+                    break;
+                }
+            }
+            let mut record = |kind: u8, data: &[u8]| {
+                let mut header = [0u8; 8];
+                header[0] = FCGI_VERSION;
+                header[1] = kind;
+                header[2..4].copy_from_slice(&1u16.to_be_bytes());
+                header[4..6].copy_from_slice(&(data.len() as u16).to_be_bytes());
+                upstream.write_all(&header).unwrap();
+                upstream.write_all(data).unwrap();
+            };
+            record(
+                STDOUT,
+                b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nh2",
+            );
+            record(END_REQUEST, &[0; 8]);
+        });
+
+        let mut config = ServerConfig {
+            root_dir: root.clone(),
+            front_controller: Some("/index.php".to_string()),
+            ..ServerConfig::default()
+        };
+        config.fastcgi_routes.push(FastCgiRoute {
+            host: "*".to_string(),
+            prefix: "/index.php".to_string(),
+            endpoint: format!("tcp://{address}"),
+            document_root: root,
+        });
+        let request = HttpRequest {
+            method: crate::server::http::Method::Get,
+            uri: "/admin".to_string(),
+            version: "HTTP/2.0".to_string(),
+            headers: vec![("Host".to_string(), "example.test".to_string())],
+            body: Vec::new(),
+        };
+        let (_, reader, _) =
+            open_h2_response(&request, &config, false, "127.0.0.1:12345".parse().unwrap())
+                .unwrap()
+                .expect("front controller H2 route");
+        assert!(reader.is_some());
+        server.join().unwrap();
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[cfg(unix)]

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use config::{parse_veysrule_file, validate_veysrule_tree, ConfigManager, ServerConfig};
 use server::Server;
 
-const VERSION: &str = "0.6.0";
+const VERSION: &str = "0.6.1";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -194,7 +194,7 @@ fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 fn print_help() {
     println!(
         r#"
-veysrs - Lightweight HTTP/1.1 & HTTP/2 Web Server in Rust (v0.6.0)
+veysrs - Lightweight HTTP/1.1 & HTTP/2 Web Server in Rust (v0.6.1)
 
 USAGE:
     veysrs serve [OPTIONS]

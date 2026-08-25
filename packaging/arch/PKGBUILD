@@ -1,5 +1,5 @@
 pkgname=veysrs
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc='Bounded blocking Rust HTTP/1.1 and HTTP/2 server'
 arch=('x86_64' 'aarch64')

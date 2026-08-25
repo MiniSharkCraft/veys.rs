@@ -775,6 +775,69 @@ pub(crate) fn secure_script_path(root: &Path, relative: &Path) -> std::io::Resul
     Ok(path)
 }
 
+/// Return whether a request resolves to a static file or directory under the
+/// configured root. This uses the same fd/component boundary as the static
+/// handler so a front-controller decision cannot turn an unsafe path into a
+/// FastCGI request. A configured front controller is considered the directory
+/// index only when no other static index exists.
+fn normalized_request_path(req: &HttpRequest) -> Option<PathBuf> {
+    let decoded_uri = percent_decode_recursive(&req.uri)?;
+    let clean_path = decoded_uri
+        .split('?')
+        .next()
+        .unwrap_or(&decoded_uri)
+        .split('#')
+        .next()
+        .unwrap_or(&decoded_uri);
+    normalize_relative_path(clean_path).ok()
+}
+
+pub(crate) fn request_path_is_safe(req: &HttpRequest, config: &ServerConfig) -> bool {
+    let Some(relative) = normalized_request_path(req) else {
+        return false;
+    };
+    !is_protected_rule_path(&relative)
+        && (!config.deny_hidden_files || !has_hidden_component(&relative))
+}
+
+pub(crate) fn request_has_static_target(req: &HttpRequest, config: &ServerConfig) -> bool {
+    let Some(relative) = normalized_request_path(req) else {
+        return false;
+    };
+    if !request_path_is_safe(req, config) {
+        return false;
+    }
+    let Ok(canonical_root) = fs::canonicalize(&config.root_dir) else {
+        return false;
+    };
+    let indexes = ["index.html", "index.htm"];
+
+    if !relative.as_os_str().is_empty() {
+        if open_beneath_with_index(&canonical_root, &relative, &indexes).is_ok() {
+            return true;
+        }
+        return open_beneath_directory(&canonical_root, &relative).is_ok();
+    }
+
+    if open_beneath_directory(&canonical_root, &relative).is_err() {
+        return false;
+    }
+    for index in indexes {
+        if open_beneath(&canonical_root, Path::new(index)).is_ok() {
+            return true;
+        }
+    }
+
+    if let Some(controller) = config.front_controller.as_deref() {
+        if let Ok(controller_relative) = normalize_relative_path(controller) {
+            if open_beneath(&canonical_root, &controller_relative).is_ok() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn apply_custom_headers(mut resp: HttpResponse, headers: &[(String, String)]) -> HttpResponse {
     for (name, val) in headers {
         resp = resp.with_header(name, val);
@@ -1247,6 +1310,51 @@ mod tests {
         } else {
             panic!("expected autoindex body");
         }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn front_controller_only_handles_missing_static_resources() {
+        let root =
+            std::env::temp_dir().join(format!("veysrs-front-controller-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("css")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("index.php"), b"<?php").unwrap();
+        fs::write(root.join("css/app.css"), b"body{}").unwrap();
+
+        let config = ServerConfig {
+            root_dir: root.clone(),
+            front_controller: Some("/index.php".to_string()),
+            ..ServerConfig::default()
+        };
+        let request = |uri: &str| HttpRequest {
+            method: Method::Get,
+            uri: uri.to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "localhost".to_string())],
+            body: Vec::new(),
+        };
+
+        // Root has no static index.html, so Laravel's index.php is selected.
+        assert!(!request_has_static_target(&request("/"), &config));
+        assert!(request_has_static_target(&request("/css/app.css"), &config));
+        assert!(request_has_static_target(&request("/docs/"), &config));
+        assert!(!request_has_static_target(
+            &request("/login?foo=bar"),
+            &config
+        ));
+        assert!(!request_has_static_target(
+            &request("/%2e%2e/index.php"),
+            &config
+        ));
+
+        let disabled = ServerConfig {
+            front_controller: None,
+            ..config.clone()
+        };
+        assert!(request_has_static_target(&request("/"), &disabled));
+        assert!(!request_has_static_target(&request("/missing"), &disabled));
         fs::remove_dir_all(root).ok();
     }
 

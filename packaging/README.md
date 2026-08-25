@@ -1,4 +1,4 @@
-# VeySRS v0.6.0 Packaging
+# VeySRS v0.6.1 Packaging
 
 The packaging files describe the native Linux installation layout:
 
@@ -22,8 +22,8 @@ From the repository root, create a clean source archive without `target/`,
 `.git/`, credentials, temporary files, or previous package outputs:
 
 ```bash
-git archive --format=tar.gz --prefix=veysrs-0.6.0/ \
-  -o release/veysrs-0.6.0.tar.gz HEAD
+git archive --format=tar.gz --prefix=veysrs-0.6.1/ \
+  -o release/veysrs-0.6.1.tar.gz HEAD
 ```
 
 The archive contains source, documentation, packaging metadata, and the
@@ -52,13 +52,13 @@ presence of these metadata files.
 
 ## Arch Linux
 
-`packaging/arch/PKGBUILD` builds `veysrs-0.6.0`. Place the clean
-`veysrs-0.6.0.tar.gz` beside the PKGBUILD, then run in an Arch build
+`packaging/arch/PKGBUILD` builds `veysrs-0.6.1`. Place the clean
+`veysrs-0.6.1.tar.gz` beside the PKGBUILD, then run in an Arch build
 environment:
 
 ```bash
 makepkg -sf
-sudo pacman -U ./veysrs-0.6.0-1-*.pkg.tar.zst
+sudo pacman -U ./veysrs-0.6.1-1-*.pkg.tar.zst
 ```
 
 The PKGBUILD uses `cargo build --release --locked` and installs the binary and
@@ -77,7 +77,7 @@ systemctl enable --now veysrs
 ```
 
 Use `systemctl reload veysrs` or `veysrs config reload` for validated atomic
-reloads. HTTP/3 and QUIC are not packaged or supported in v0.6.0.
+reloads. HTTP/3 and QUIC are not packaged or supported in v0.6.1.
 
 ## Docker
 
