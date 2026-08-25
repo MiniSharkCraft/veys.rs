@@ -1,0 +1,21 @@
+pkgname=veysrs
+pkgver=0.6.0
+pkgrel=1
+pkgdesc='Bounded blocking Rust HTTP/1.1 and HTTP/2 server'
+arch=('x86_64' 'aarch64')
+url='https://example.invalid/veysrs'
+license=('MIT')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  # Arch's global target-cpu=native flags can break ring's static-symbol
+  # linkage on non-native build hosts. Cargo's release profile remains active.
+  env -u RUSTFLAGS -u CFLAGS -u CXXFLAGS -u LDFLAGS cargo build --release --locked
+}
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 target/release/veysrs "$pkgdir/usr/bin/veysrs"
+  install -Dm644 packaging/systemd/veysrs.service "$pkgdir/usr/lib/systemd/system/veysrs.service"
+}

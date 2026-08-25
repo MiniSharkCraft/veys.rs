@@ -58,9 +58,10 @@ rule files, percent-encoded forms, and normalized traversal attempts return
 opened component-by-component with `openat(O_NOFOLLOW)` on Unix, so validation
 and opening share one fd-based boundary.
 
-Rewrites are parsed and bounded, but regex execution is intentionally deferred
-until a dedicated safe regex engine is introduced. Directory auto-index
-generation and custom error-page streaming remain compatibility-limited.
+Rewrites are parsed, validated, and bounded for forward compatibility, but are
+not applied to requests in v0.6.0. Directory auto-index generation and custom
+error pages are implemented with bounded enumeration/file reads and the same
+document-root boundary as static files.
 
 ## Validation
 

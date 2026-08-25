@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -82,6 +83,56 @@ pub struct ServerConfig {
     pub http2_max_frame_size: u32,
     pub http2_max_header_block_size: usize,
     pub http2_initial_window_size: u32,
+    pub tls_enabled: bool,
+    pub tls_certificate: Option<PathBuf>,
+    pub tls_private_key: Option<PathBuf>,
+    pub vhosts: Vec<VhostConfig>,
+    /// Trusted, root-file-only HTTP proxy routes.
+    pub proxy_routes: Vec<ProxyRoute>,
+    /// Trusted, root-file-only FastCGI routes.
+    pub fastcgi_routes: Vec<FastCgiRoute>,
+    pub log_format: String,
+    pub access_log: String,
+    pub error_log: String,
+    pub rate_limit_per_second: u32,
+    pub rate_limit_burst: u32,
+    pub max_connections_per_ip: usize,
+    pub security_x_content_type_options: Option<String>,
+    pub security_referrer_policy: Option<String>,
+    pub security_x_frame_options: Option<String>,
+    pub security_content_security_policy: Option<String>,
+    pub compression_enabled: bool,
+    pub compression_level: u32,
+    pub compression_min_size: u64,
+    pub compression_mime_types: Vec<String>,
+    pub upstream_health_interval: u64,
+    pub upstream_health_timeout: u64,
+    pub upstream_health_failures: u32,
+    pub upstream_health_recovery: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyRoute {
+    pub host: String,
+    pub prefix: String,
+    pub upstream: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastCgiRoute {
+    pub host: String,
+    pub prefix: String,
+    pub endpoint: String,
+    pub document_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VhostConfig {
+    pub host: String,
+    pub root_dir: PathBuf,
+    pub config_file: Option<PathBuf>,
+    pub tls_certificate: Option<PathBuf>,
+    pub tls_private_key: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -109,6 +160,36 @@ impl Default for ServerConfig {
             http2_max_frame_size: 16_384,
             http2_max_header_block_size: 65_536,
             http2_initial_window_size: 65_535,
+            tls_enabled: false,
+            tls_certificate: None,
+            tls_private_key: None,
+            vhosts: Vec::new(),
+            proxy_routes: Vec::new(),
+            fastcgi_routes: Vec::new(),
+            log_format: "text".to_string(),
+            access_log: "stdout".to_string(),
+            error_log: "stderr".to_string(),
+            rate_limit_per_second: 0,
+            rate_limit_burst: 0,
+            max_connections_per_ip: 0,
+            security_x_content_type_options: Some("nosniff".to_string()),
+            security_referrer_policy: Some("strict-origin-when-cross-origin".to_string()),
+            security_x_frame_options: None,
+            security_content_security_policy: None,
+            compression_enabled: true,
+            compression_level: 6,
+            compression_min_size: 1024,
+            compression_mime_types: vec![
+                "text/".to_string(),
+                "application/javascript".to_string(),
+                "application/json".to_string(),
+                "application/xml".to_string(),
+                "image/svg+xml".to_string(),
+            ],
+            upstream_health_interval: 0,
+            upstream_health_timeout: 2,
+            upstream_health_failures: 3,
+            upstream_health_recovery: 2,
         }
     }
 }
@@ -928,6 +1009,392 @@ pub fn parse_veysrule_content(
                     });
                 }
             }
+            "LOG_FORMAT" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "LOG_FORMAT is a root-only directive".to_string(),
+                    });
+                } else if matches!(val.to_ascii_lowercase().as_str(), "text" | "json") {
+                    server_config.log_format = val.to_ascii_lowercase();
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "LOG_FORMAT must be text or json".to_string(),
+                    });
+                }
+            }
+            "ACCESS_LOG" | "ERROR_LOG" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("{} is a root-only directive", key),
+                    });
+                } else if val == "stdout"
+                    || val == "stderr"
+                    || (val.starts_with('/') && val.len() <= 4096)
+                {
+                    if key == "ACCESS_LOG" {
+                        server_config.access_log = val.to_string();
+                    } else {
+                        server_config.error_log = val.to_string();
+                    }
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("invalid {} destination", key),
+                    });
+                }
+            }
+            "COMPRESSION_ENABLED" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "COMPRESSION_ENABLED is a root-only directive".to_string(),
+                    });
+                } else {
+                    match val.to_ascii_lowercase().as_str() {
+                        "on" | "true" => server_config.compression_enabled = true,
+                        "off" | "false" => server_config.compression_enabled = false,
+                        _ => errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "COMPRESSION_ENABLED must be on or off".to_string(),
+                        }),
+                    }
+                }
+            }
+            "COMPRESSION_LEVEL" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "COMPRESSION_LEVEL is a root-only directive".to_string(),
+                    });
+                } else if let Ok(level) = val.parse::<u32>() {
+                    if level <= 9 {
+                        server_config.compression_level = level;
+                    } else {
+                        errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "COMPRESSION_LEVEL must be 0..9".to_string(),
+                        });
+                    }
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid COMPRESSION_LEVEL".to_string(),
+                    });
+                }
+            }
+            "COMPRESSION_MIN_SIZE" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "COMPRESSION_MIN_SIZE is a root-only directive".to_string(),
+                    });
+                } else if let Ok(size) = val.parse::<u64>() {
+                    server_config.compression_min_size = size;
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid COMPRESSION_MIN_SIZE".to_string(),
+                    });
+                }
+            }
+            "COMPRESSION_MIME" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "COMPRESSION_MIME is a root-only directive".to_string(),
+                    });
+                } else if val.contains('/') && !val.contains(['\r', '\n', '\0']) {
+                    server_config
+                        .compression_mime_types
+                        .push(val.to_ascii_lowercase());
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid COMPRESSION_MIME".to_string(),
+                    });
+                }
+            }
+            "UPSTREAM_HEALTH_INTERVAL"
+            | "UPSTREAM_HEALTH_TIMEOUT"
+            | "UPSTREAM_HEALTH_FAILURES"
+            | "UPSTREAM_HEALTH_RECOVERY" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("{} is a root-only directive", key),
+                    });
+                } else if let Ok(value) = val.parse::<u64>() {
+                    if value == 0 {
+                        errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: format!("{} must be greater than zero", key),
+                        });
+                    } else {
+                        match key {
+                            "UPSTREAM_HEALTH_INTERVAL" => {
+                                server_config.upstream_health_interval = value.min(86_400)
+                            }
+                            "UPSTREAM_HEALTH_TIMEOUT" => {
+                                server_config.upstream_health_timeout = value.min(300)
+                            }
+                            "UPSTREAM_HEALTH_FAILURES" => {
+                                server_config.upstream_health_failures =
+                                    value.min(u32::MAX as u64) as u32
+                            }
+                            "UPSTREAM_HEALTH_RECOVERY" => {
+                                server_config.upstream_health_recovery =
+                                    value.min(u32::MAX as u64) as u32
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("invalid {}", key),
+                    });
+                }
+            }
+            "RATE_LIMIT_PER_SECOND" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "RATE_LIMIT_PER_SECOND is a root-only directive".to_string(),
+                    });
+                } else if let Ok(rate) = val.parse::<u32>() {
+                    server_config.rate_limit_per_second = rate;
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid RATE_LIMIT_PER_SECOND".to_string(),
+                    });
+                }
+            }
+            "RATE_LIMIT_BURST" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "RATE_LIMIT_BURST is a root-only directive".to_string(),
+                    });
+                } else if let Ok(burst) = val.parse::<u32>() {
+                    server_config.rate_limit_burst = burst;
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid RATE_LIMIT_BURST".to_string(),
+                    });
+                }
+            }
+            "MAX_CONNECTIONS_PER_IP" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "MAX_CONNECTIONS_PER_IP is a root-only directive".to_string(),
+                    });
+                } else if let Ok(limit) = val.parse::<usize>() {
+                    server_config.max_connections_per_ip = limit;
+                } else {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "invalid MAX_CONNECTIONS_PER_IP".to_string(),
+                    });
+                }
+            }
+            "SECURITY_X_CONTENT_TYPE_OPTIONS"
+            | "SECURITY_REFERRER_POLICY"
+            | "SECURITY_X_FRAME_OPTIONS"
+            | "SECURITY_CONTENT_SECURITY_POLICY" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("{} is a root-only directive", key),
+                    });
+                } else if !valid_header_value(val) {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: format!("invalid {} value", key),
+                    });
+                } else {
+                    match key {
+                        "SECURITY_X_CONTENT_TYPE_OPTIONS" => {
+                            server_config.security_x_content_type_options = Some(val.to_string())
+                        }
+                        "SECURITY_REFERRER_POLICY" => {
+                            server_config.security_referrer_policy = Some(val.to_string())
+                        }
+                        "SECURITY_X_FRAME_OPTIONS" => {
+                            server_config.security_x_frame_options = Some(val.to_string())
+                        }
+                        _ => server_config.security_content_security_policy = Some(val.to_string()),
+                    }
+                }
+            }
+            "TLS_ENABLED" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "TLS_ENABLED is a root-only directive".to_string(),
+                    });
+                } else {
+                    match val.to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => server_config.tls_enabled = true,
+                        "false" | "0" | "no" => server_config.tls_enabled = false,
+                        _ => errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "TLS_ENABLED must be boolean (true/false)".to_string(),
+                        }),
+                    }
+                }
+            }
+            "TLS_CERTIFICATE" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "TLS_CERTIFICATE is a root-only directive".to_string(),
+                    });
+                } else if val.is_empty() {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "TLS_CERTIFICATE cannot be empty".to_string(),
+                    });
+                } else {
+                    server_config.tls_certificate = Some(PathBuf::from(val));
+                }
+            }
+            "TLS_PRIVATE_KEY" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "TLS_PRIVATE_KEY is a root-only directive".to_string(),
+                    });
+                } else if val.is_empty() {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "TLS_PRIVATE_KEY cannot be empty".to_string(),
+                    });
+                } else {
+                    server_config.tls_private_key = Some(PathBuf::from(val));
+                }
+            }
+            "VHOST" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "VHOST is a root-only directive".to_string(),
+                    });
+                } else {
+                    let fields: Vec<&str> = val.split_whitespace().collect();
+                    if fields.len() < 2
+                        || fields.len() > 5
+                        || fields[0].contains('/')
+                        || fields[0].contains(':')
+                    {
+                        errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "VHOST expects host root [rule-file]".to_string(),
+                        });
+                    } else {
+                        server_config.vhosts.push(VhostConfig {
+                            host: fields[0].to_ascii_lowercase(),
+                            root_dir: PathBuf::from(fields[1]),
+                            config_file: fields.get(2).map(PathBuf::from),
+                            tls_certificate: fields.get(3).map(PathBuf::from),
+                            tls_private_key: fields.get(4).map(PathBuf::from),
+                        });
+                    }
+                }
+            }
+            "PROXY" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "PROXY is a root-only directive".to_string(),
+                    });
+                } else {
+                    let fields: Vec<&str> = val.split_whitespace().collect();
+                    if fields.len() != 3
+                        || !valid_route_prefix(fields[1])
+                        || !valid_upstream(fields[2])
+                    {
+                        errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "PROXY expects host prefix http://host:port".to_string(),
+                        });
+                    } else {
+                        server_config.proxy_routes.push(ProxyRoute {
+                            host: fields[0].to_ascii_lowercase(),
+                            prefix: fields[1].to_string(),
+                            upstream: fields[2].to_string(),
+                        });
+                    }
+                }
+            }
+            "FASTCGI" => {
+                if !is_root {
+                    errors.push(ConfigParseError {
+                        file_name: file_name.to_string(),
+                        line_number: line_num,
+                        message: "FASTCGI is a root-only directive".to_string(),
+                    });
+                } else {
+                    let fields: Vec<&str> = val.split_whitespace().collect();
+                    if fields.len() != 4
+                        || !valid_route_prefix(fields[1])
+                        || !valid_fastcgi_endpoint(fields[2])
+                        || fields[3].is_empty()
+                    {
+                        errors.push(ConfigParseError {
+                            file_name: file_name.to_string(),
+                            line_number: line_num,
+                            message: "FASTCGI expects host prefix unix:/path|tcp://host:port document-root".to_string(),
+                        });
+                    } else {
+                        server_config.fastcgi_routes.push(FastCgiRoute {
+                            host: fields[0].to_ascii_lowercase(),
+                            prefix: fields[1].to_string(),
+                            endpoint: fields[2].to_string(),
+                            document_root: PathBuf::from(fields[3]),
+                        });
+                    }
+                }
+            }
             "DENY_HIDDEN_FILES" => match val.to_lowercase().as_str() {
                 "true" | "1" | "yes" => {
                     dir_config.deny_hidden_files = Some(true);
@@ -993,14 +1460,57 @@ pub fn parse_veysrule_content(
     (server_config, dir_config, errors)
 }
 
+fn valid_route_prefix(prefix: &str) -> bool {
+    prefix.starts_with('/')
+        && !prefix.contains(['\r', '\n', '\0'])
+        && !prefix.split('/').any(|component| component == "..")
+}
+
+fn valid_upstream(upstream: &str) -> bool {
+    if upstream.contains(',') {
+        return upstream
+            .split(',')
+            .all(|candidate| valid_upstream(candidate.trim()));
+    }
+    let Some(rest) = upstream.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !host.is_empty()
+        && !rest.contains(['/', '?', '#', '@', '\r', '\n', '\0'])
+        && port.parse::<u16>().is_ok()
+}
+
+fn valid_fastcgi_endpoint(endpoint: &str) -> bool {
+    if let Some(path) = endpoint.strip_prefix("unix:") {
+        return !path.is_empty() && path.len() <= 4096 && !path.contains(['\r', '\n', '\0']);
+    }
+    let Some(rest) = endpoint.strip_prefix("tcp://") else {
+        return false;
+    };
+    let Some((host, port)) = rest.rsplit_once(':') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !host.is_empty()
+        && !rest.contains(['/', '?', '#', '@', '\r', '\n', '\0'])
+        && port.parse::<u16>().is_ok()
+}
+
 struct CacheEntry {
     config: DirectoryConfig,
     mtime: Option<SystemTime>,
+    generation: u64,
 }
 
 /// Cache quản lý cấu hình `.veysrule` cấp thư mục
 pub struct ConfigManager {
     cache: RwLock<HashMap<PathBuf, CacheEntry>>,
+    generation: AtomicU64,
+    error_log: RwLock<String>,
 }
 
 /// Validate the root rule file and every non-symlinked descendant rule file.
@@ -1034,6 +1544,9 @@ pub fn validate_veysrule_tree(
             if metadata.is_dir() {
                 stack.push(path);
             } else if entry.file_name() == ".veysrule" {
+                if root_config.is_some_and(|root| root == path) {
+                    continue;
+                }
                 let (_, _, mut parse_errors) = parse_veysrule_file(&path, false);
                 errors.append(&mut parse_errors);
             }
@@ -1044,8 +1557,71 @@ pub fn validate_veysrule_tree(
 
 impl ConfigManager {
     pub fn new() -> Self {
+        Self::new_with_error_log("stderr")
+    }
+
+    pub fn new_with_error_log(destination: &str) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+            error_log: RwLock::new(destination.to_string()),
+        }
+    }
+
+    pub fn set_error_log(&self, destination: &str) {
+        if let Ok(mut current) = self.error_log.write() {
+            *current = destination.to_string();
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        let destination = self
+            .error_log
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| "stderr".to_string());
+        crate::server::logging::warn(&destination, message);
+    }
+
+    /// Drop all cached directory rules before publishing a new runtime
+    /// configuration snapshot. Callers perform validation before invoking this.
+    pub fn clear_cache(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut guard) = self.cache.write() {
+            guard.clear();
+        }
+    }
+
+    /// Prime the immutable rule snapshot used by request handling. This keeps
+    /// a rejected reload from exposing a partially written or invalid file.
+    pub fn preload_tree(&self, root_config_file: Option<&Path>, root_dir: &Path) {
+        if let Some(path) = root_config_file {
+            let _ = self.load_dir_config(path, false, true);
+        }
+        let mut stack = vec![root_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    stack.push(path);
+                } else if entry.file_name() == ".veysrule" {
+                    if root_config_file.is_some_and(|root| root == path) {
+                        continue;
+                    }
+                    if let Ok(relative) = path.strip_prefix(root_dir) {
+                        let _ = self.load_dir_config_beneath(root_dir, relative, false, false);
+                    }
+                }
+            }
         }
     }
 
@@ -1098,25 +1674,31 @@ impl ConfigManager {
             .file_type()
             .is_symlink()
         {
-            eprintln!(
-                "[WARN] ignoring symlinked rule file {}",
+            self.warn(&format!(
+                "ignoring symlinked rule file {}",
                 rule_path.display()
-            );
+            ));
             return None;
         }
         let metadata = fs::metadata(rule_path).ok()?;
         let current_mtime = metadata.modified().ok();
+        let generation = self.generation.load(Ordering::Acquire);
 
         if !dev_mode {
             if let Ok(guard) = self.cache.read() {
                 if let Some(entry) = guard.get(rule_path) {
-                    return Some(entry.config.clone());
+                    if entry.generation == generation {
+                        return Some(entry.config.clone());
+                    }
                 }
             }
         } else {
             if let Ok(guard) = self.cache.read() {
                 if let Some(entry) = guard.get(rule_path) {
-                    if entry.mtime == current_mtime && current_mtime.is_some() {
+                    if entry.generation == generation
+                        && entry.mtime == current_mtime
+                        && current_mtime.is_some()
+                    {
                         return Some(entry.config.clone());
                     }
                 }
@@ -1126,19 +1708,22 @@ impl ConfigManager {
         let (_, dir_cfg, parse_errors) = parse_veysrule_file(rule_path, is_root);
         if !parse_errors.is_empty() {
             for err in parse_errors {
-                eprintln!("[WARN] Config error: {}", err);
+                self.warn(&format!("Config error: {err}"));
             }
             return None;
         }
 
         if let Ok(mut guard) = self.cache.write() {
-            guard.insert(
-                rule_path.to_path_buf(),
-                CacheEntry {
-                    config: dir_cfg.clone(),
-                    mtime: current_mtime,
-                },
-            );
+            if self.generation.load(Ordering::Acquire) == generation {
+                guard.insert(
+                    rule_path.to_path_buf(),
+                    CacheEntry {
+                        config: dir_cfg.clone(),
+                        mtime: current_mtime,
+                        generation,
+                    },
+                );
+            }
         }
 
         Some(dir_cfg)
@@ -1153,16 +1738,22 @@ impl ConfigManager {
     ) -> Option<DirectoryConfig> {
         let cache_key = root_dir.join(relative_rule);
         let (content, current_mtime) = read_rule_file_beneath(root_dir, relative_rule).ok()?;
+        let generation = self.generation.load(Ordering::Acquire);
 
         if !dev_mode {
             if let Ok(guard) = self.cache.read() {
                 if let Some(entry) = guard.get(&cache_key) {
-                    return Some(entry.config.clone());
+                    if entry.generation == generation {
+                        return Some(entry.config.clone());
+                    }
                 }
             }
         } else if let Ok(guard) = self.cache.read() {
             if let Some(entry) = guard.get(&cache_key) {
-                if entry.mtime == current_mtime && current_mtime.is_some() {
+                if entry.generation == generation
+                    && entry.mtime == current_mtime
+                    && current_mtime.is_some()
+                {
                     return Some(entry.config.clone());
                 }
             }
@@ -1172,19 +1763,22 @@ impl ConfigManager {
             parse_veysrule_content(&content, &cache_key.to_string_lossy(), is_root);
         if !parse_errors.is_empty() {
             for err in parse_errors {
-                eprintln!("[WARN] Config error: {}", err);
+                self.warn(&format!("Config error: {err}"));
             }
             return None;
         }
 
         if let Ok(mut guard) = self.cache.write() {
-            guard.insert(
-                cache_key,
-                CacheEntry {
-                    config: dir_cfg.clone(),
-                    mtime: current_mtime,
-                },
-            );
+            if self.generation.load(Ordering::Acquire) == generation {
+                guard.insert(
+                    cache_key,
+                    CacheEntry {
+                        config: dir_cfg.clone(),
+                        mtime: current_mtime,
+                        generation,
+                    },
+                );
+            }
         }
         Some(dir_cfg)
     }
@@ -1415,6 +2009,44 @@ MAX_CONNECTIONS = 9999
         assert_eq!(effective.cache, Some(true));
     }
 
+    #[test]
+    fn test_tls_and_vhost_root_directives() {
+        let content = "TLS_ENABLED = true\nTLS_CERTIFICATE = /etc/veysrs/cert.pem\nTLS_PRIVATE_KEY = /etc/veysrs/key.pem\nVHOST = example.test /var/www/example\n";
+        let (config, _, errors) = parse_veysrule_content(content, ".veysrule", true);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert!(config.tls_enabled);
+        assert_eq!(
+            config.tls_certificate,
+            Some(PathBuf::from("/etc/veysrs/cert.pem"))
+        );
+        assert_eq!(config.vhosts[0].host, "example.test");
+    }
+
+    #[test]
+    fn test_proxy_and_fastcgi_are_root_only_and_validated() {
+        let content = "PROXY = example.test /api/ http://127.0.0.1:3000\nFASTCGI = example.test / unix:/run/php.sock /var/www/example\n";
+        let (cfg, _, errors) = parse_veysrule_content(content, ".veysrule", true);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(cfg.proxy_routes[0].prefix, "/api/");
+        assert_eq!(cfg.fastcgi_routes[0].endpoint, "unix:/run/php.sock");
+
+        let (_, _, errors) =
+            parse_veysrule_content("PROXY = * / http://127.0.0.1:1\n", "child/.veysrule", false);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("root-only"));
+    }
+
+    #[test]
+    fn test_upstream_health_settings_are_bounded() {
+        let content = "UPSTREAM_HEALTH_INTERVAL = 5\nUPSTREAM_HEALTH_TIMEOUT = 2\nUPSTREAM_HEALTH_FAILURES = 3\nUPSTREAM_HEALTH_RECOVERY = 2\n";
+        let (cfg, _, errors) = parse_veysrule_content(content, ".veysrule", true);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(cfg.upstream_health_interval, 5);
+        assert_eq!(cfg.upstream_health_timeout, 2);
+        assert_eq!(cfg.upstream_health_failures, 3);
+        assert_eq!(cfg.upstream_health_recovery, 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_rule_inheritance_does_not_follow_symlink_directory() {
@@ -1434,5 +2066,22 @@ MAX_CONNECTIONS = 9999
         assert!(cfg.headers.iter().all(|(name, _)| name != "X-Outside"));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn clear_cache_publishes_updated_root_rule() {
+        let root = std::env::temp_dir().join(format!("veysrs-rule-reload-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let rule = root.join(".veysrule");
+        fs::write(&rule, "header X-Reload one\n").unwrap();
+        let manager = ConfigManager::new();
+        let first = manager.get_config_for_dir(Some(&rule), &root, Path::new("index.html"), false);
+        assert_eq!(first.headers[0].1, "one");
+        fs::write(&rule, "header X-Reload two\n").unwrap();
+        manager.clear_cache();
+        let second = manager.get_config_for_dir(Some(&rule), &root, Path::new("index.html"), false);
+        assert_eq!(second.headers[0].1, "two");
+        fs::remove_dir_all(root).ok();
     }
 }

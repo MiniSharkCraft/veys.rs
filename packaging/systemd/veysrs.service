@@ -1,0 +1,29 @@
+[Unit]
+Description=VeySRS HTTP/1.1 and HTTP/2 server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=veysrs
+Group=veysrs
+WorkingDirectory=/var/lib/veysrs
+RuntimeDirectory=veysrs
+ExecStart=/usr/bin/veysrs serve --config /etc/veysrs/veysrs.veysrule --root /var/lib/veysrs/www
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGTERM
+TimeoutStopSec=35s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/veysrs /var/log/veysrs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

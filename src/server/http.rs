@@ -1,6 +1,5 @@
 use std::fmt;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 
 use crate::config::ServerConfig;
@@ -38,11 +37,15 @@ impl From<&str> for Method {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StatusCode {
     Ok = 200,
+    Created = 201,
+    Accepted = 202,
+    NoContent = 204,
     MovedPermanently = 301,
     Found = 302,
     PartialContent = 206,
     NotModified = 304,
     BadRequest = 400,
+    Unauthorized = 401,
     Forbidden = 403,
     NotFound = 404,
     MethodNotAllowed = 405,
@@ -51,9 +54,12 @@ pub enum StatusCode {
     UriTooLong = 414,
     RangeNotSatisfiable = 416,
     RequestHeaderFieldsTooLarge = 431,
+    TooManyRequests = 429,
     InternalServerError = 500,
+    BadGateway = 502,
     NotImplemented = 501,
     ServiceUnavailable = 503,
+    GatewayTimeout = 504,
     HttpVersionNotSupported = 505,
 }
 
@@ -65,11 +71,15 @@ impl StatusCode {
     pub fn reason_phrase(&self) -> &'static str {
         match self {
             StatusCode::Ok => "OK",
+            StatusCode::Created => "Created",
+            StatusCode::Accepted => "Accepted",
+            StatusCode::NoContent => "No Content",
             StatusCode::MovedPermanently => "Moved Permanently",
             StatusCode::Found => "Found",
             StatusCode::PartialContent => "Partial Content",
             StatusCode::NotModified => "Not Modified",
             StatusCode::BadRequest => "Bad Request",
+            StatusCode::Unauthorized => "Unauthorized",
             StatusCode::Forbidden => "Forbidden",
             StatusCode::NotFound => "Not Found",
             StatusCode::MethodNotAllowed => "Method Not Allowed",
@@ -78,10 +88,46 @@ impl StatusCode {
             StatusCode::UriTooLong => "URI Too Long",
             StatusCode::RangeNotSatisfiable => "Range Not Satisfiable",
             StatusCode::RequestHeaderFieldsTooLarge => "Request Header Fields Too Large",
+            StatusCode::TooManyRequests => "Too Many Requests",
             StatusCode::InternalServerError => "Internal Server Error",
+            StatusCode::BadGateway => "Bad Gateway",
             StatusCode::NotImplemented => "Not Implemented",
             StatusCode::ServiceUnavailable => "Service Unavailable",
+            StatusCode::GatewayTimeout => "Gateway Timeout",
             StatusCode::HttpVersionNotSupported => "HTTP Version Not Supported",
+        }
+    }
+
+    pub fn from_u16(code: u16) -> Self {
+        match code {
+            200 => Self::Ok,
+            201 => Self::Created,
+            202 => Self::Accepted,
+            204 => Self::NoContent,
+            301 => Self::MovedPermanently,
+            302 => Self::Found,
+            206 => Self::PartialContent,
+            304 => Self::NotModified,
+            400 => Self::BadRequest,
+            401 => Self::Unauthorized,
+            403 => Self::Forbidden,
+            404 => Self::NotFound,
+            405 => Self::MethodNotAllowed,
+            408 => Self::RequestTimeout,
+            413 => Self::PayloadTooLarge,
+            414 => Self::UriTooLong,
+            416 => Self::RangeNotSatisfiable,
+            431 => Self::RequestHeaderFieldsTooLarge,
+            429 => Self::TooManyRequests,
+            500 => Self::InternalServerError,
+            501 => Self::NotImplemented,
+            502 => Self::BadGateway,
+            503 => Self::ServiceUnavailable,
+            504 => Self::GatewayTimeout,
+            505 => Self::HttpVersionNotSupported,
+            _ if (400..=499).contains(&code) => Self::BadRequest,
+            _ if (500..=599).contains(&code) => Self::InternalServerError,
+            _ => Self::InternalServerError,
         }
     }
 }
@@ -146,15 +192,163 @@ impl HttpRequest {
 
     pub fn is_keep_alive(&self) -> bool {
         if let Some(conn) = self.get_header("Connection") {
-            if conn.eq_ignore_ascii_case("close") {
+            let mut tokens = conn.split(',').map(str::trim);
+            if tokens
+                .clone()
+                .any(|token| token.eq_ignore_ascii_case("close"))
+            {
                 return false;
             }
-            if conn.eq_ignore_ascii_case("keep-alive") {
+            if tokens.any(|token| token.eq_ignore_ascii_case("keep-alive")) {
                 return true;
             }
         }
         self.version == "HTTP/1.1"
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpRequestHead {
+    pub method: Method,
+    pub uri: String,
+    pub version: String,
+    pub headers: Vec<(String, String)>,
+    pub content_length: usize,
+    pub header_len: usize,
+}
+
+impl HttpRequestHead {
+    pub fn into_request(self, body: Vec<u8>) -> HttpRequest {
+        HttpRequest {
+            method: self.method,
+            uri: self.uri,
+            version: self.version,
+            headers: self.headers,
+            body,
+        }
+    }
+}
+
+/// Parse and validate only an HTTP/1.1 header block. The input buffer is not
+/// modified, allowing a dynamic handler to forward the body as it arrives.
+pub fn parse_http_request_head_from_buf_with_limits(
+    buffer: &[u8],
+    config: &ServerConfig,
+) -> Result<Option<HttpRequestHead>, HttpParseError> {
+    let header_end = match find_subslice(buffer, b"\r\n\r\n") {
+        Some(pos) => pos,
+        None => {
+            if buffer.len() > config.max_header_size {
+                return Err(HttpParseError::OversizedHeader);
+            }
+            return Ok(None);
+        }
+    };
+    if header_end + 4 > config.max_header_size {
+        return Err(HttpParseError::OversizedHeader);
+    }
+    let header_bytes = &buffer[..header_end];
+    for (idx, byte) in header_bytes.iter().enumerate() {
+        if (*byte == b'\n' && (idx == 0 || header_bytes[idx - 1] != b'\r'))
+            || (*byte == b'\r' && (idx + 1 >= header_bytes.len() || header_bytes[idx + 1] != b'\n'))
+        {
+            return Err(HttpParseError::MalformedRequest);
+        }
+    }
+    let header_str =
+        std::str::from_utf8(header_bytes).map_err(|_| HttpParseError::MalformedRequest)?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines.next().ok_or(HttpParseError::MalformedRequest)?;
+    let parts: Vec<&str> = request_line.split(' ').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || part.contains('\t'))
+    {
+        return Err(HttpParseError::MalformedRequest);
+    }
+    if !parts[0].bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(HttpParseError::MalformedRequest);
+    }
+    let uri = parts[1].to_string();
+    if uri.len() > config.max_uri_length {
+        return Err(HttpParseError::OversizedRequestLine);
+    }
+    if request_line.len() > config.max_header_line
+        || uri.bytes().any(|byte| byte <= 31 || byte == 127)
+    {
+        return Err(if request_line.len() > config.max_header_line {
+            HttpParseError::OversizedHeaderLine
+        } else {
+            HttpParseError::MalformedRequest
+        });
+    }
+    if parts[2] != "HTTP/1.1" {
+        return Err(HttpParseError::UnsupportedVersion);
+    }
+
+    let mut headers = Vec::new();
+    let mut hosts = Vec::new();
+    let mut lengths = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() > config.max_header_line {
+            return Err(HttpParseError::OversizedHeaderLine);
+        }
+        if headers.len() >= config.max_headers {
+            return Err(HttpParseError::TooManyHeaders);
+        }
+        let (raw_name, raw_value) = line
+            .split_once(':')
+            .ok_or(HttpParseError::MalformedRequest)?;
+        if raw_name.is_empty() || !raw_name.bytes().all(is_tchar) {
+            return Err(HttpParseError::MalformedRequest);
+        }
+        let name = raw_name.to_string();
+        let value = raw_value.trim().to_string();
+        if value.contains(['\r', '\n']) {
+            return Err(HttpParseError::MalformedRequest);
+        }
+        if name.eq_ignore_ascii_case("Host") {
+            hosts.push(value.clone());
+        } else if name.eq_ignore_ascii_case("Content-Length") {
+            lengths.push(value.clone());
+        } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
+            return Err(HttpParseError::ChunkedEncodingNotImplemented);
+        }
+        headers.push((name, value));
+    }
+    if hosts.len() != 1 || hosts[0].trim().is_empty() {
+        return Err(if hosts.is_empty() {
+            HttpParseError::MissingHost
+        } else {
+            HttpParseError::MalformedHost
+        });
+    }
+    let content_length = if let Some(first) = lengths.first() {
+        if lengths.iter().any(|value| value != first) {
+            return Err(HttpParseError::ConflictingHeaders);
+        }
+        let length = first
+            .parse::<usize>()
+            .map_err(|_| HttpParseError::MalformedContentLength)?;
+        if length > config.max_request_size {
+            return Err(HttpParseError::OversizedBody);
+        }
+        length
+    } else {
+        0
+    };
+    Ok(Some(HttpRequestHead {
+        method: Method::from(parts[0]),
+        uri,
+        version: parts[2].to_string(),
+        headers,
+        content_length,
+        header_len: header_end + 4,
+    }))
 }
 
 #[allow(dead_code)]
@@ -169,157 +363,16 @@ pub fn parse_http_request_from_buf_with_limits(
     buffer: &mut Vec<u8>,
     config: &ServerConfig,
 ) -> Result<Option<HttpRequest>, HttpParseError> {
-    if buffer.len() > config.max_header_size {
-        return Err(HttpParseError::OversizedHeader);
-    }
-
-    let header_end = match find_subslice(buffer, b"\r\n\r\n") {
-        Some(pos) => pos,
-        None => return Ok(None),
+    let Some(head) = parse_http_request_head_from_buf_with_limits(buffer, config)? else {
+        return Ok(None);
     };
-
-    let header_bytes = &buffer[..header_end];
-    // HTTP/1.1 uses CRLF exclusively. `str::lines()` also accepts bare LF,
-    // which can create parser differentials with a proxy in front of VeySRS.
-    for (idx, byte) in header_bytes.iter().enumerate() {
-        if *byte == b'\n' && (idx == 0 || header_bytes[idx - 1] != b'\r') {
-            return Err(HttpParseError::MalformedRequest);
-        }
-        if *byte == b'\r' && (idx + 1 >= header_bytes.len() || header_bytes[idx + 1] != b'\n') {
-            return Err(HttpParseError::MalformedRequest);
-        }
-    }
-    let header_str =
-        std::str::from_utf8(header_bytes).map_err(|_| HttpParseError::MalformedRequest)?;
-
-    let mut lines = header_str.split("\r\n");
-
-    // 1. Request Line Parsing & Limits
-    let request_line = lines.next().ok_or(HttpParseError::MalformedRequest)?;
-
-    let rl_parts: Vec<&str> = request_line.split(' ').collect();
-    if rl_parts.len() != 3
-        || rl_parts
-            .iter()
-            .any(|part| part.is_empty() || part.contains('\t'))
-    {
-        return Err(HttpParseError::MalformedRequest);
-    }
-
-    let raw_method = rl_parts[0];
-    if !raw_method.bytes().all(|b| b.is_ascii_alphabetic()) {
-        return Err(HttpParseError::MalformedRequest);
-    }
-    let method = Method::from(raw_method);
-    let uri = rl_parts[1].to_string();
-    let version = rl_parts[2].to_string();
-
-    // Kiểm tra giới hạn URI trước để trả về 414 URI Too Long khi URI vượt MAX_URI_LENGTH
-    if uri.len() > config.max_uri_length {
-        return Err(HttpParseError::OversizedRequestLine);
-    }
-
-    if request_line.len() > config.max_header_line {
-        return Err(HttpParseError::OversizedHeaderLine);
-    }
-
-    if uri.bytes().any(|b| b <= 31 || b == 127) {
-        return Err(HttpParseError::MalformedRequest);
-    }
-
-    if version != "HTTP/1.1" {
-        return Err(HttpParseError::UnsupportedVersion);
-    }
-
-    let mut headers = Vec::new();
-    let mut host_headers = Vec::new();
-    let mut content_length_values = Vec::new();
-
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if line.len() > config.max_header_line {
-            return Err(HttpParseError::OversizedHeaderLine);
-        }
-
-        if headers.len() >= config.max_headers {
-            return Err(HttpParseError::TooManyHeaders);
-        }
-
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            return Err(HttpParseError::MalformedRequest);
-        }
-
-        let raw_name = parts[0];
-        if raw_name.is_empty() || !raw_name.bytes().all(is_tchar) {
-            return Err(HttpParseError::MalformedRequest);
-        }
-
-        let name = raw_name.to_string();
-        let value = parts[1].trim().to_string();
-
-        if value.contains('\r') || value.contains('\n') {
-            return Err(HttpParseError::MalformedRequest);
-        }
-
-        if name.eq_ignore_ascii_case("Host") {
-            host_headers.push(value.clone());
-        } else if name.eq_ignore_ascii_case("Content-Length") {
-            content_length_values.push(value.clone());
-        } else if name.eq_ignore_ascii_case("Transfer-Encoding") {
-            return Err(HttpParseError::ChunkedEncodingNotImplemented);
-        }
-
-        headers.push((name, value));
-    }
-
-    if host_headers.is_empty() {
-        return Err(HttpParseError::MissingHost);
-    }
-    if host_headers.len() > 1 {
-        return Err(HttpParseError::MalformedHost);
-    }
-    if host_headers[0].trim().is_empty() {
-        return Err(HttpParseError::MalformedHost);
-    }
-
-    let mut content_length = 0;
-    if !content_length_values.is_empty() {
-        let first_cl = &content_length_values[0];
-        for cl in &content_length_values[1..] {
-            if cl != first_cl {
-                return Err(HttpParseError::ConflictingHeaders);
-            }
-        }
-
-        content_length = first_cl
-            .trim()
-            .parse::<usize>()
-            .map_err(|_| HttpParseError::MalformedContentLength)?;
-
-        if content_length > config.max_request_size {
-            return Err(HttpParseError::OversizedBody);
-        }
-    }
-
-    let total_required = header_end + 4 + content_length;
+    let total_required = head.header_len.saturating_add(head.content_length);
     if buffer.len() < total_required {
         return Ok(None);
     }
-
-    let body_bytes = buffer[header_end + 4..total_required].to_vec();
+    let body_bytes = buffer[head.header_len..total_required].to_vec();
     buffer.drain(..total_required);
-
-    Ok(Some(HttpRequest {
-        method,
-        uri,
-        version,
-        headers,
-        body: body_bytes,
-    }))
+    Ok(Some(head.into_request(body_bytes)))
 }
 
 fn is_tchar(byte: u8) -> bool {
@@ -354,6 +407,7 @@ pub enum BodySource {
     Bytes(Vec<u8>),
     File(Arc<std::fs::File>, u64),
     FileRange(Arc<std::fs::File>, u64, u64),
+    GzipFile(Arc<std::fs::File>, u64, u32),
 }
 
 impl Default for BodySource {
@@ -374,7 +428,7 @@ impl HttpResponse {
     pub fn new(status: StatusCode) -> Self {
         Self {
             status,
-            headers: vec![("Server".to_string(), "veysrs/0.5.0".to_string())],
+            headers: vec![("Server".to_string(), "veysrs/0.6.0".to_string())],
             body_source: BodySource::Bytes(Vec::new()),
             close_connection: false,
         }
@@ -430,10 +484,11 @@ impl HttpResponse {
             BodySource::Bytes(b) => b.len(),
             BodySource::File(_, sz) => *sz as usize,
             BodySource::FileRange(_, _, len) => *len as usize,
+            BodySource::GzipFile(_, len, _) => *len as usize,
         }
     }
 
-    pub fn send_to(&self, stream: &mut TcpStream) -> Result<(), std::io::Error> {
+    pub fn send_to<S: Write>(&self, stream: &mut S) -> Result<(), std::io::Error> {
         let mut response_bytes = Vec::new();
 
         let status_line = format!(
@@ -444,7 +499,15 @@ impl HttpResponse {
         response_bytes.extend_from_slice(status_line.as_bytes());
 
         let mut has_connection_header = false;
+        let chunked = matches!(self.body_source, BodySource::GzipFile(..));
+        let has_transfer_encoding = self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Transfer-Encoding"));
         for (name, val) in &self.headers {
+            if chunked && name.eq_ignore_ascii_case("Content-Length") {
+                continue;
+            }
             if name.eq_ignore_ascii_case("Connection") {
                 has_connection_header = true;
             }
@@ -458,6 +521,9 @@ impl HttpResponse {
             } else {
                 response_bytes.extend_from_slice(b"Connection: keep-alive\r\n");
             }
+        }
+        if chunked && !has_transfer_encoding {
+            response_bytes.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
 
         response_bytes.extend_from_slice(b"\r\n");
@@ -500,11 +566,43 @@ impl HttpResponse {
                     remaining -= n as u64;
                 }
             }
+            BodySource::GzipFile(file, _, level) => {
+                use flate2::read::GzEncoder;
+                use flate2::Compression;
+                let source = file.try_clone()?;
+                let mut encoder = GzEncoder::new(source, Compression::new(*level));
+                write_chunked(stream, &mut encoder, chunked)?;
+            }
         }
 
         stream.flush()?;
         Ok(())
     }
+}
+
+fn write_chunked<S: Write, R: Read>(
+    stream: &mut S,
+    reader: &mut R,
+    chunked: bool,
+) -> Result<(), std::io::Error> {
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            if chunked {
+                stream.write_all(b"0\r\n\r\n")?;
+            }
+            break;
+        }
+        if chunked {
+            write!(stream, "{:x}\r\n", n)?;
+            stream.write_all(&chunk[..n])?;
+            stream.write_all(b"\r\n")?;
+        } else {
+            stream.write_all(&chunk[..n])?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -520,6 +618,22 @@ mod tests {
         assert_eq!(req.version, "HTTP/1.1");
         assert_eq!(req.get_header("Host"), Some("localhost"));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn connection_header_uses_case_insensitive_tokens_and_close_wins() {
+        let request = |value: &str| HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Connection".to_string(), value.to_string())],
+            body: Vec::new(),
+        };
+        assert!(request(" keep-alive ").is_keep_alive());
+        assert!(request("KEEP-ALIVE, upgrade").is_keep_alive());
+        assert!(!request("keep-alive, close").is_keep_alive());
+        assert!(!request(" CLOSE , keep-alive ").is_keep_alive());
+        assert!(!request("close").is_keep_alive());
     }
 
     #[test]
@@ -600,6 +714,33 @@ mod tests {
             let mut buf = input.to_vec();
             let _ = parse_http_request_from_buf(&mut buf);
         }
+    }
+
+    #[test]
+    fn gzip_file_response_is_streamed_with_chunked_framing() {
+        let path = std::env::temp_dir().join(format!("veysrs-gzip-{}", std::process::id()));
+        std::fs::write(&path, vec![b'a'; 4096]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let response = HttpResponse::new(StatusCode::Ok)
+            .with_header("Content-Encoding", "gzip")
+            .with_header("Content-Type", "text/plain");
+        let mut response = response;
+        response.body_source = BodySource::GzipFile(Arc::new(file), 4096, 6);
+        let mut wire = Vec::new();
+        response.send_to(&mut wire).unwrap();
+        let header_end = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        assert!(std::str::from_utf8(&wire[..header_end])
+            .unwrap()
+            .contains("Transfer-Encoding: chunked"));
+        assert!(wire[header_end + 4..]
+            .windows(2)
+            .any(|window| window == [0x1f, 0x8b]));
+        let body = wire.split(|b| *b == b'\r').collect::<Vec<_>>();
+        assert!(!body.is_empty());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

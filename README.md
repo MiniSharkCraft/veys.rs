@@ -1,229 +1,172 @@
-<div align="center">
+# VeySRS
 
-# 🚀 veysrs
+VeySRS 0.6.0 is a bounded, blocking Rust web server for HTTP/1.1 and HTTP/2.
+It uses a fixed thread pool and ordinary TCP sockets; it does not use Tokio or
+another async runtime. TLS and gzip are provided by focused Rust crates.
 
-**Lightweight, Multithreaded HTTP/1.1 Static Web Server written in Pure Rust**
+The v0.6.0 scope is feature-complete for the current architecture. HTTP/3 and
+QUIC are explicitly deferred to a post-v1.0 roadmap.
 
-[![Rust Edition](https://img.shields.io/badge/Rust-2021-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org)
-[![HTTP Protocol](https://img.shields.io/badge/HTTP-1.1-blue?style=for-the-badge)](https://tools.ietf.org/html/rfc2616)
-[![Version](https://img.shields.io/badge/version-0.5.0-green?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs/Cargo.toml)
-[![Tests](https://img.shields.io/badge/tests-22%2F22%20passing-success?style=for-the-badge)](file:///home/congmc/AMoon/Veysrs)
+## Capabilities
 
----
+- Strict HTTP/1.1 parsing with CRLF validation, request limits, keep-alive,
+  range requests, ETags, conditional requests, and bounded body handling.
+- HTTP/2 framing, HPACK, SETTINGS, CONTINUATION, stream state validation,
+  connection/stream flow control, fair DATA scheduling, and bounded concurrent
+  streams.
+- TLS 1.2/1.3, ALPN (`h2` and `http/1.1`), SNI, and per-vhost certificates.
+- Host and `:authority` virtual-host routing with isolated document roots and
+  VeyRule inheritance.
+- Secure static files, directory redirects/index selection, bounded autoindex,
+  ranges, custom error pages, MIME overrides, and protected `.veysrule` files.
+- Trusted, configuration-only HTTP/1.1 reverse proxy routes, WebSocket relay,
+  and FastCGI/PHP-FPM over TCP or Unix sockets.
+- Incremental bounded proxy/FastCGI streaming, route-scoped idle pooling for
+  safe HTTP/1.1 upstream reuse, round-robin selection, passive failure
+  cooldown, optional active health checks, and conservative idempotent retries.
+- Streaming gzip negotiation for eligible responses, configurable security
+  headers, per-IP rate limiting, connection limits, structured access/error
+  logging, Prometheus metrics, diagnostics, and atomic configuration reload.
 
-> *Small footprint. Bounded memory resources. Hardened request handling & Range Requests.*
+VeySRS does not execute shell commands or application code, and clients cannot
+select arbitrary upstream destinations.
 
-</div>
+## Security model
 
-## 📖 Introduction
+Static files, VeyRule files, vhost roots, and custom error pages use document
+root validation and Unix component traversal with `O_NOFOLLOW` where supported.
+Traversal, encoded dot segments, intermediate/final symlinks, protected
+`.veysrule` files, malformed headers, conflicting framing, oversized input,
+and invalid FastCGI responses are rejected. PHP-FPM reopens
+`SCRIPT_FILENAME` in another process, so deployments must prevent untrusted
+writers from replacing files below the configured script root.
 
-**veysrs** (Vey Server.rs) is a lightweight HTTP/1.1 static web server built from scratch using pure **Rust Standard Library (`std`)** with **zero external dependencies**.
+The blocking architecture is bounded by worker count, request/header limits,
+HTTP/2 stream limits, upstream permits, connection limits, rate-limit state,
+and fixed-size streaming buffers. `Transfer-Encoding: chunked` request bodies
+are rejected rather than partially interpreted.
 
-Designed for predictable memory usage, high reliability, and clear execution flow, `veysrs` employs a synchronous blocking TCP I/O architecture paired with a fixed worker thread pool (`ThreadPool`), per-directory `.veysrule` configuration inheritance, ETags, conditional requests (`304 Not Modified`), and HTTP Range Requests (`206 Partial Content`).
+## Build and run
 
-> [!NOTE]
-> `veysrs` is built strictly with Rust `std` without high-level web frameworks (Axum, Actix-web, Hyper, Warp) or async runtimes (Tokio).
-
----
-
-## ✨ Features
-
-| Feature | Description | Status |
-|:---|:---|:---:|
-| 🌐 **HTTP/1.1 Parsing** | Strict HTTP/1.1 request line and header validation | ✅ |
-| 🧵 **Thread Pool** | Synchronous worker thread pool with worker panic isolation | ✅ |
-| 📁 **Static Serving** | MIME-type auto-detection and static asset delivery | ✅ |
-| 🏷️ **ETags & Conditional** | Automatic ETag, Last-Modified, `If-None-Match`, `If-Modified-Since` → `304 Not Modified` | ✅ |
-| ✂️ **Range Requests** | HTTP byte Range Requests (`206 Partial Content` & `416 Range Not Satisfiable`) | ✅ |
-| ⚡ **Bounded Streaming** | Fixed 64KB stack buffer streaming for full & range file requests | ✅ |
-| 🔒 **Path Security** | Protection against canonical path traversal and symlink escapes | ✅ |
-| 🕵️ **Hidden File Blocking** | Restricted access to dotfiles (`.veysrule`, `.env`, `.git`) | ✅ |
-| ⏱️ **Socket Timeouts** | Independent read, write, and keep-alive socket idle timeouts | ✅ |
-| 🚦 **Connection Limiting** | Atomic connection guard with HTTP 503 fallback | ✅ |
-| 🛡️ **Resource Limits** | Configurable bounds on URI, headers, line size, and payload body | ✅ |
-| 🔄 **Keep-Alive Pipelining** | Persistent HTTP/1.1 TCP connections with per-connection request counts | ✅ |
-| 📴 **Graceful Shutdown** | Safe SIGINT handling with channel closure and thread joining | ✅ |
-| ⚙️ **`.veysrule` System** | Hierarchical per-directory configuration inheritance | ✅ |
-
----
-
-## 🛡️ Security & Hardening
-
-`veysrs` v0.5.0 implements comprehensive production-hardening mechanisms against common web vulnerabilities:
-
-- **Path Traversal Protection**: Double percent-decoding defense (`%252e%252e` → `%2e%2e` → `..`) combined with `fs::canonicalize()` validation against `ROOT_DIR`.
-- **Symlink Escape Protection**: Verifies that canonical file target paths remain strictly inside `canonical_root`.
-- **Dotfile Protection**: Automatically blocks requests containing hidden file components (e.g. `/.veysrule`, `/.env`, `/.git/config`) when `DENY_HIDDEN_FILES` is enabled.
-- **Resource Boundary Limits**:
-  - `MAX_URI_LENGTH`: 8,192 bytes (returns `414 URI Too Long`).
-  - `MAX_HEADER_LINE`: 8,192 bytes (returns `431 Request Header Fields Too Large`).
-  - `MAX_HEADERS`: 64 headers maximum (returns `431 Request Header Fields Too Large`).
-  - `MAX_HEADER_SIZE`: 16,384 bytes (returns `431 Request Header Fields Too Large`).
-  - `MAX_REQUEST_SIZE`: 65,536 bytes (returns `413 Payload Too Large`).
-- **Connection Guard**: Tracks active connections atomically. Rejects excess connections with `503 Service Unavailable` and drains unread socket buffers to prevent TCP RST anomalies.
-- **Socket Timeouts**: Socket read/write timeouts (10s) prevent slowloris-style hanging connections.
-
-> [!IMPORTANT]
-> All file body reads use bounded 64KB stack buffers (`[0u8; 65536]`). The server never loads entire static files into heap memory.
-
----
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- [Rust Toolchain](https://www.rust-lang.org/tools/install) (Edition 2021)
-
-### Building & Running
+Prerequisites: Rust stable and a native C linker suitable for the target.
 
 ```bash
-# Clone repository
-git clone <repository-url>
+git clone https://github.com/MiniSharkCraft/veys.rs.git
 cd veysrs
-
-# Check format, lints & test
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-
-# Build optimized release binary
+cargo check --all-targets
+cargo test --all-targets
 cargo build --release
-
-# Run veysrs on port 8989
-./target/release/veysrs --port 8989
+./target/release/veysrs serve --root ./public --config ./.veysrule --port 8080
 ```
 
-### Verification
+The compatibility form `veysrs [OPTIONS]` is also accepted. Check the binary
+version with `veysrs version` or `veysrs --version`.
 
-```bash
-# Fetch root index page (returns 200 OK + ETag + Last-Modified)
-curl -i http://127.0.0.1:8989/
+## Basic configuration
 
-# Test Conditional 304 Not Modified
-curl -i -H 'If-None-Match: "<etag-from-above>"' http://127.0.0.1:8989/
-
-# Test Range Request (206 Partial Content)
-curl -i -H 'Range: bytes=0-49' http://127.0.0.1:8989/
-```
-
----
-
-## ⚙️ Configuration
-
-`veysrs` uses a hierarchical `.veysrule` configuration file. Directives defined at the root apply globally, while child `.veysrule` files in subdirectories inherit and override directory-level settings.
-
-### Configuration Directives
-
-| Directive | Type | Description | Default |
-|:---|:---|:---|:---|
-| `WORKERS` | Root-only | Number of worker threads in pool | `4` |
-| `MAX_REQUEST_SIZE` | Root-only | Maximum request body size in bytes | `65536` (64 KB) |
-| `MAX_HEADER_SIZE` | Root-only | Maximum total header block size in bytes | `16384` (16 KB) |
-| `MAX_HEADERS` | Root-only | Maximum number of headers per request | `64` |
-| `MAX_HEADER_LINE` | Root-only | Maximum length of a single header line | `8192` (8 KB) |
-| `MAX_URI_LENGTH` | Root-only | Maximum URI length in bytes | `8192` (8 KB) |
-| `READ_TIMEOUT` | Root-only | Socket read timeout in seconds | `10` |
-| `WRITE_TIMEOUT` | Root-only | Socket write timeout in seconds | `10` |
-| `KEEP_ALIVE_TIMEOUT` | Root-only | Idle Keep-Alive timeout in seconds | `10` |
-| `MAX_CONNECTIONS` | Root-only | Maximum simultaneous TCP connections | `1024` |
-| `MAX_REQUESTS_PER_CONNECTION` | Root-only | Max requests served per Keep-Alive connection | `100` |
-| `DENY_HIDDEN_FILES` | Directory | Block access to hidden files (`.env`, `.git`) | `true` |
-| `DENY_IP` | Directory | Block specific client IP addresses | None |
-| `ADD_HEADER` | Directory | Append custom HTTP response header (`Header: Value`) | None |
-| `REDIRECT_404` | Directory | Custom 404 error page path | None |
-
----
-
-## 🖥️ CLI Usage
-
-`veysrs` provides flexible command-line flags:
+The root `.veysrule` uses legacy `KEY = VALUE` directives for server settings;
+directory rules also support native lowercase directives. A minimal setup is:
 
 ```text
-USAGE:
-    veysrs [OPTIONS]
-
-OPTIONS:
-    --host <HOST>                  Host IP address to bind (default: 127.0.0.1)
-    --port <PORT>                  Port to listen on (default: 8080)
-    --root <DIR>                   Root directory for static files (default: ./public)
-    --config <FILE>                Path to root .veysrule file (default: ./.veysrule)
-    --workers <COUNT>              Number of worker threads (default: 4)
-    --max-connections <COUNT>      Maximum concurrent TCP connections (default: 1024)
-    --max-request-size <BYTES>     Maximum HTTP request size in bytes (default: 65536)
-    --dev                          Enable development mode (hot reload config)
-    --help, -h                     Print help information
-    --version, -v                  Print version information
+PORT = 8080
+ROOT_DIR = /var/lib/veysrs/www
+WORKERS = 4
+MAX_CONNECTIONS = 1024
+TLS_ENABLED = false
+COMPRESSION_ENABLED = true
+ACCESS_LOG = stdout
+ERROR_LOG = stderr
 ```
 
----
-
-## 📂 Project Structure
+TLS and vhosts:
 
 ```text
-veysrs/
-├── .veysrule                  # Root server & security configuration
-├── Cargo.toml                 # Rust package manifest (0 external dependencies)
-├── Cargo.lock                 # Lockfile
-├── README.md                  # Project documentation
-├── docs/
-│   ├── v0.3-hardening.md      # v0.5.0 hardening specification
-│   └── v0.4-hardening.md      # v0.5.0 technical specification
-├── public/
-│   └── index.html             # Default static web asset
-├── release/
-│   └── veysrs-v0.5.0.tar.gz   # Release archive
-└── src/
-    ├── main.rs                # Entrypoint & CLI parser
-    ├── config/                # .veysrule parser & inheritance manager
-    │   ├── mod.rs
-    │   └── veysrule.rs
-    ├── router/                # Request handler, ETags, 304, 206 Range & security
-    │   ├── mod.rs
-    │   └── handler.rs
-    └── server/                # TCP listener, HTTP/1.1 parser & ThreadPool
-        ├── mod.rs
-        ├── http.rs
-        ├── listener.rs
-        └── threadpool.rs
+TLS_ENABLED = true
+TLS_CERTIFICATE = /etc/veysrs/certs/site-chain.pem
+TLS_PRIVATE_KEY = /etc/veysrs/certs/site-key.pem
+VHOST = example.com /var/lib/veysrs/www/example
+VHOST = panel.example.com /var/lib/veysrs/www/panel
+VHOST = * /var/lib/veysrs/www/default
 ```
 
----
+Trusted proxy/FastCGI routes are root-only:
 
-## 🧪 Testing
+```text
+PROXY = example.com /api/ http://127.0.0.1:3000
+FASTCGI = panel.example.com / unix:/run/php/php-fpm.sock /var/lib/veysrs/www/panel
+```
+
+See [docs/tls-vhosts.md](docs/tls-vhosts.md) and
+[docs/veysrule.md](docs/veysrule.md) for full syntax
+and inheritance rules.
+
+## CLI and operations
+
+```text
+veysrs serve [--host HOST] [--port PORT] [--root DIR] [--config FILE]
+             [--workers COUNT] [--max-connections COUNT]
+             [--max-request-size BYTES] [--dev] [--pid-file FILE]
+veysrs version
+veysrs config test [--root DIR] [--config FILE]
+veysrs config show [--root DIR] [--config FILE]
+veysrs config path [--config FILE]
+veysrs config reload [--root DIR] [--config FILE] [--pid-file FILE]
+veysrs doctor [--root DIR] [--config FILE] [--port PORT]
+veysrs health [--root DIR] [--config FILE] [--port PORT]
+veysrs rules show DIRECTORY
+```
+
+`config test` validates the root and reachable VeyRule tree. `config reload`
+validates a complete replacement, including TLS material and vhosts, before
+publishing an immutable runtime snapshot; failure leaves the old snapshot
+active. `doctor` checks deployment prerequisites without exposing secrets.
+`/metrics` is a bounded Prometheus-compatible endpoint.
+
+## systemd deployment
+
+The unit at `packaging/systemd/veysrs.service` runs as the dedicated `veysrs`
+user, uses `ProtectSystem=strict`, `NoNewPrivileges`, a private temporary
+directory, bounded writable paths, and SIGTERM/SIGHUP integration.
 
 ```bash
-# Run format check
-cargo fmt --check
-
-# Run clippy lints
-cargo clippy --all-targets --all-features -- -D warnings
-
-# Run unit test suite
-cargo test
+install -d -o veysrs -g veysrs /etc/veysrs /var/lib/veysrs/www /var/log/veysrs
+install -m 0644 packaging/systemd/veysrs.service /usr/lib/systemd/system/veysrs.service
+install -m 0755 target/release/veysrs /usr/bin/veysrs
+systemctl daemon-reload
+systemctl enable --now veysrs
+systemctl reload veysrs
 ```
 
-> [!TIP]
-> All 22 unit tests pass cleanly out of the box (`22/22 passing`).
+The service expects `/etc/veysrs/veysrs.veysrule`, `/var/lib/veysrs/www`, and
+`/var/log/veysrs`. Package metadata and Arch/Debian workflows are described in
+[packaging/README.md](packaging/README.md).
 
----
+## Troubleshooting
 
-## ⚠️ Current Limitations
+- Run `veysrs config test` before starting or reloading.
+- Use `veysrs doctor` for root, permissions, worker, port, TLS, and service
+  unit diagnostics.
+- A certificate/key mismatch or missing PEM object fails startup/reload.
+- Check `ERROR_LOG` for listener, TLS, proxy, FastCGI, reload, and worker
+  failures; logging destinations are bounded and failure-safe.
+- `502` indicates an upstream/proxy/FastCGI failure; verify endpoint reachability
+  and timeouts.
+- `503` may indicate connection/rate admission limits or no healthy upstream.
+- FastCGI Unix sockets are per-request; ensure the service user can access the
+  socket and the configured script root.
 
-- **HTTP/3 Unimplemented**: HTTP/3 + QUIC planned for v1.0+.
-- **No Native TLS/HTTPS**: Standard HTTP/1.1 plaintext only (use reverse proxies like Nginx/Caddy for SSL termination).
-- **Chunked Transfer-Encoding Unimplemented**: `Transfer-Encoding: chunked` requests return `501 Not Implemented`.
+## Testing and status
 
----
+The release validation suite covers unit, protocol, filesystem, TLS, proxy,
+FastCGI, WebSocket, logging, limits, reload, and tiny-window HTTP/2 behavior.
+The current local tree passes the complete Rust matrix; external VPS,
+Docker-runtime, cargo-fuzz, and cross-server benchmark evidence is not claimed
+by this repository release and remains deployment-specific work.
 
-## 🗺️ Roadmap
+VeySRS 0.6.0 is the current feature-complete release for HTTP/1.1 and HTTP/2.
+HTTP/3 and QUIC are **post-v1.0 / deferred**.
 
-- [x] HTTP/2 multiplexing, HPACK, and flow control.
-- [ ] HTTP/3 + QUIC support (planned for v1.0+).
-- [ ] HTTPS / TLS support.
-- [ ] Enhanced access logging formats (JSON struct logs).
+## License
 
----
-
-## 📄 License
-
-> License information will be added before the first public release.
+MIT. See [LICENSE](LICENSE).

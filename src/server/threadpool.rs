@@ -17,7 +17,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(
+        id: usize,
+        receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
+        error_log: Option<Arc<String>>,
+    ) -> Worker {
         let thread = thread::spawn(move || loop {
             // Lock only long enough to dequeue a job; release before executing.
             // Previously the MutexGuard was held across the blocking recv(), which
@@ -36,7 +40,14 @@ impl Worker {
                 Ok(job) => {
                     let result = catch_unwind(AssertUnwindSafe(job));
                     if result.is_err() {
-                        eprintln!("[ERROR] ThreadPool worker {} caught job panic", id);
+                        if let Some(destination) = error_log.as_deref() {
+                            crate::server::logging::error(
+                                destination,
+                                &format!("ThreadPool worker {id} caught job panic"),
+                            );
+                        } else {
+                            eprintln!("[ERROR] ThreadPool worker {} caught job panic", id);
+                        }
                     }
                 }
                 Err(_) => {
@@ -55,17 +66,29 @@ impl Worker {
 #[allow(dead_code)]
 impl ThreadPool {
     pub fn new(size: usize) -> Result<ThreadPool, &'static str> {
+        Self::with_error_log(size, None)
+    }
+
+    pub fn new_with_error_log(size: usize, destination: &str) -> Result<ThreadPool, &'static str> {
+        Self::with_error_log(size, Some(destination.to_string()))
+    }
+
+    fn with_error_log(
+        size: usize,
+        destination: Option<String>,
+    ) -> Result<ThreadPool, &'static str> {
         if size == 0 {
             return Err("ThreadPool size must be greater than 0");
         }
 
         let (sender, receiver) = mpsc::channel();
         let receiver = Arc::new(Mutex::new(receiver));
+        let error_log = destination.map(Arc::new);
 
         let mut workers = Vec::with_capacity(size);
 
         for id in 0..size {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
+            workers.push(Worker::new(id, Arc::clone(&receiver), error_log.clone()));
         }
 
         Ok(ThreadPool {
@@ -137,6 +160,18 @@ mod tests {
         drop(pool);
 
         assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[test]
+    fn worker_panics_use_configured_error_log() {
+        let path =
+            std::env::temp_dir().join(format!("veysrs-threadpool-error-{}", std::process::id()));
+        let pool = ThreadPool::new_with_error_log(1, path.to_str().unwrap()).unwrap();
+        pool.execute(|| panic!("test worker panic")).unwrap();
+        drop(pool);
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert!(output.contains("caught job panic"));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

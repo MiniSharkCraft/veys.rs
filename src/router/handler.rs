@@ -1,10 +1,13 @@
 use std::fs::{self, File};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 use crate::config::{ConfigManager, ServerConfig};
 use crate::server::http::{BodySource, HttpRequest, HttpResponse, Method, StatusCode};
+
+const MAX_ERROR_PAGE_BYTES: u64 = 1024 * 1024;
 
 pub struct RequestHandler<'a> {
     config: &'a ServerConfig,
@@ -20,10 +23,67 @@ impl<'a> RequestHandler<'a> {
     }
 
     pub fn handle_request(&self, req: &HttpRequest, peer_addr: Option<SocketAddr>) -> HttpResponse {
+        if let Some(peer) = peer_addr {
+            if !crate::server::limits::global().allow_request(
+                peer.ip(),
+                self.config.rate_limit_per_second,
+                self.config.rate_limit_burst,
+            ) {
+                let mut response = HttpResponse::new(StatusCode::TooManyRequests)
+                    .with_header("Retry-After", "1")
+                    .with_body(
+                        b"429 Too Many Requests".to_vec(),
+                        "text/plain; charset=utf-8",
+                    );
+                apply_security_headers(&mut response, self.config);
+                return response;
+            }
+        }
+        let mut response = if select_vhost(self.config, req).is_some() {
+            let request_config = self.effective_config(req);
+            let vhost_handler = RequestHandler::new(&request_config, self.config_manager);
+            vhost_handler.handle_request_inner(req, peer_addr)
+        } else {
+            self.handle_request_inner(req, peer_addr)
+        };
+        apply_security_headers(&mut response, self.config);
+        response
+    }
+
+    /// Return the effective vhost configuration without exposing optional
+    /// rule-file paths as an escape hatch.
+    pub fn effective_config(&self, req: &HttpRequest) -> ServerConfig {
+        let mut effective = self.config.clone();
+        if let Some(vhost) = select_vhost(self.config, req) {
+            effective.root_dir = vhost.root_dir.clone();
+            effective.config_file = vhost.root_dir.join(".veysrule");
+            effective.tls_certificate = vhost.tls_certificate.clone();
+            effective.tls_private_key = vhost.tls_private_key.clone();
+        }
+        effective
+    }
+
+    fn handle_request_inner(
+        &self,
+        req: &HttpRequest,
+        peer_addr: Option<SocketAddr>,
+    ) -> HttpResponse {
+        let _request_guard = crate::server::metrics::RequestGuard::begin();
         let start_time = Instant::now();
         let peer_ip_str = peer_addr
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|| "unknown".to_string());
+
+        if req.uri.split('?').next().unwrap_or("") == "/metrics" {
+            let response = HttpResponse::new(StatusCode::Ok)
+                .with_header("Content-Type", "text/plain; version=0.0.4")
+                .with_body(
+                    crate::server::metrics::render_prometheus().into_bytes(),
+                    "text/plain; version=0.0.4",
+                );
+            self.log_access(&peer_ip_str, req, &response, start_time);
+            return response;
+        }
 
         match req.method {
             Method::Get | Method::Head => {}
@@ -188,6 +248,38 @@ impl<'a> RequestHandler<'a> {
             .as_ref()
             .map(|files| files.iter().map(String::as_str).collect())
             .unwrap_or_else(|| vec!["index.html"]);
+
+        if let Ok(directory) = open_beneath_directory(&canonical_root, &rel_path) {
+            let has_slash = clean_path_str.ends_with('/');
+            if !has_slash && !clean_path_str.is_empty() {
+                let location = format!("{clean_path_str}/");
+                let mut response = HttpResponse::new(StatusCode::MovedPermanently)
+                    .with_header("Location", &location)
+                    .with_body(Vec::new(), "text/plain; charset=utf-8");
+                response = apply_custom_headers(response, &merged_config.headers);
+                response = apply_rule_headers(response, &merged_config);
+                self.log_access(&peer_ip_str, req, &response, start_time);
+                return response;
+            }
+            let has_index = configured_indexes
+                .iter()
+                .find_map(|index| {
+                    let mut index_path = rel_path.clone();
+                    index_path.push(index);
+                    open_beneath(&canonical_root, &index_path).ok()
+                })
+                .is_some();
+            if !has_index && merged_config.autoindex == Some(true) {
+                let body = render_directory_listing(&directory, clean_path_str, deny_hidden);
+                let mut response =
+                    HttpResponse::new(StatusCode::Ok).with_body(body, "text/html; charset=utf-8");
+                response = apply_custom_headers(response, &merged_config.headers);
+                response = apply_rule_headers(response, &merged_config);
+                self.log_access(&peer_ip_str, req, &response, start_time);
+                return response;
+            }
+        }
+
         let (file, actual_path) =
             match open_beneath_with_index(&canonical_root, &open_path, &configured_indexes) {
                 Ok(v) => v,
@@ -306,6 +398,35 @@ impl<'a> RequestHandler<'a> {
             resp = resp.with_header("Expires", &format_http_date(expiry));
         }
 
+        let negotiable = req.method == Method::Get
+            && resp.status == StatusCode::Ok
+            && resp.body_len() as u64 >= self.config.compression_min_size
+            && response_mime_is_compressible(&resp, &self.config.compression_mime_types);
+        if negotiable && req.get_header("Accept-Encoding").is_some() {
+            ensure_vary_accept_encoding(&mut resp.headers);
+        }
+        if negotiable
+            && self.config.compression_enabled
+            && accepts_gzip(req.get_header("Accept-Encoding"))
+        {
+            let source = std::mem::replace(&mut resp.body_source, BodySource::Bytes(Vec::new()));
+            resp.body_source = match source {
+                BodySource::File(file, size) => {
+                    remove_header(&mut resp.headers, "Content-Length");
+                    vary_etag_for_encoding(&mut resp.headers, "gzip");
+                    resp.headers
+                        .push(("Content-Encoding".to_string(), "gzip".to_string()));
+                    BodySource::GzipFile(file, size, self.config.compression_level)
+                }
+                BodySource::FileRange(file, offset, length) => {
+                    // Byte ranges refer to the identity representation and are not
+                    // compressed, preserving RFC 9110 range semantics.
+                    BodySource::FileRange(file, offset, length)
+                }
+                other => other,
+            };
+        }
+
         // Enforce HEAD semantics: strip body regardless of status code
         if req.method == Method::Head {
             resp.body_source = BodySource::Bytes(Vec::new());
@@ -329,9 +450,12 @@ impl<'a> RequestHandler<'a> {
         if let Some(path) = configured_path {
             if let Ok(relative) = normalize_relative_path(path) {
                 if !is_protected_rule_path(&relative) {
-                    if let Ok((mut file, actual_path)) = open_beneath(canonical_root, &relative) {
+                    if let Ok((file, actual_path)) = open_beneath(canonical_root, &relative) {
                         let mut content = Vec::new();
-                        if std::io::Read::read_to_end(&mut file, &mut content).is_ok() {
+                        let mut limited = file.take(MAX_ERROR_PAGE_BYTES + 1);
+                        if std::io::Read::read_to_end(&mut limited, &mut content).is_ok()
+                            && content.len() as u64 <= MAX_ERROR_PAGE_BYTES
+                        {
                             return HttpResponse::new(StatusCode::NotFound)
                                 .with_body(content, get_mime_type(&actual_path));
                         }
@@ -358,23 +482,187 @@ impl<'a> RequestHandler<'a> {
         } else {
             resp.body_len()
         };
+        crate::server::metrics::record_response(resp.status.code(), body_bytes as u64);
 
-        println!(
-            "[INFO] {} \"{} {} {}\" {} {} {:.2}ms",
-            peer_ip,
-            req.method,
-            req.uri,
-            req.version,
-            resp.status.code(),
-            body_bytes,
-            duration_ms
-        );
+        let line = if self.config.log_format.eq_ignore_ascii_case("json") {
+            format!(
+                "{{\"remote_addr\":\"{}\",\"method\":\"{}\",\"path\":\"{}\",\"protocol\":\"{}\",\"status\":{},\"response_bytes\":{},\"duration_ms\":{:.2}}}\n",
+                json_escape(peer_ip),
+                json_escape(&req.method.to_string()),
+                json_escape(&req.uri),
+                json_escape(&req.version),
+                resp.status.code(),
+                body_bytes,
+                duration_ms
+            )
+        } else {
+            format!(
+                "[INFO] {} \"{} {} {}\" {} {} {:.2}ms\n",
+                peer_ip,
+                req.method,
+                req.uri,
+                req.version,
+                resp.status.code(),
+                body_bytes,
+                duration_ms
+            )
+        };
+        write_log_line(&self.config.access_log, &line);
     }
+}
+
+fn write_log_line(destination: &str, line: &str) {
+    crate::server::logging::write_line(destination, line);
+}
+
+fn render_directory_listing(directory: &File, request_path: &str, deny_hidden: bool) -> Vec<u8> {
+    let mut entries = Vec::new();
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd_path = format!("/proc/self/fd/{}", directory.as_raw_fd());
+        if let Ok(read_dir) = fs::read_dir(fd_path) {
+            for entry in read_dir.take(4096).flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == ".veysrule" || (deny_hidden && name.starts_with('.')) {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                entries.push((name, is_dir));
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut html = String::from("<!doctype html><meta charset=\"utf-8\"><title>Index</title><ul>");
+    for (name, is_dir) in entries {
+        let escaped = html_escape(&name);
+        let encoded = url_encode_path(&name);
+        let suffix = if is_dir { "/" } else { "" };
+        let line = format!("<li><a href=\"{encoded}{suffix}\">{escaped}{suffix}</a></li>");
+        if html.len() + line.len() > 1024 * 1024 {
+            break;
+        }
+        html.push_str(&line);
+    }
+    html.push_str("</ul>");
+    let _ = request_path;
+    html.into_bytes()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn url_encode_path(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect(),
+            '\n' => "\\n".chars().collect(),
+            '\r' => "\\r".chars().collect(),
+            '\t' => "\\t".chars().collect(),
+            ch if ch.is_control() => format!("\\u{:04x}", ch as u32).chars().collect(),
+            ch => vec![ch],
+        })
+        .collect()
+}
+
+fn select_vhost<'a>(
+    config: &'a ServerConfig,
+    req: &HttpRequest,
+) -> Option<&'a crate::config::VhostConfig> {
+    let host = normalize_host(req.get_header("Host")?)?;
+    config
+        .vhosts
+        .iter()
+        .find(|vhost| vhost.host == host)
+        .or_else(|| {
+            config
+                .vhosts
+                .iter()
+                .find(|vhost| vhost.host == "*" || vhost.host == "_")
+        })
+}
+
+fn normalize_host(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return None;
+    }
+    if let Some(address) = value.strip_prefix('[') {
+        let (address, suffix) = address.split_once(']')?;
+        if !suffix.is_empty() && (!suffix.starts_with(':') || suffix[1..].parse::<u16>().is_err()) {
+            return None;
+        }
+        return Some(address.to_string());
+    }
+    if let Some((name, port)) = value.rsplit_once(':') {
+        if name.contains(':') || port.parse::<u16>().is_err() {
+            return None;
+        }
+        return Some(name.to_string());
+    }
+    Some(value)
 }
 
 #[cfg(unix)]
 fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)> {
     open_beneath_with_index(root, relative, &["index.html"])
+}
+
+#[cfg(unix)]
+fn open_beneath_directory(root: &Path, relative: &Path) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    const O_CLOEXEC: i32 = 0x80000;
+    const O_DIRECTORY: i32 = 0x10000;
+    const O_NOFOLLOW: i32 = 0x20000;
+    const O_RDONLY: i32 = 0;
+    unsafe extern "C" {
+        fn openat(dirfd: RawFd, path: *const i8, flags: i32, mode: i32) -> i32;
+    }
+    let root_file = File::open(root)?;
+    let mut current = root_file;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
+        let fd = unsafe {
+            openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    Ok(current)
 }
 
 #[cfg(unix)]
@@ -456,12 +744,35 @@ fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<(File, PathBuf)
 }
 
 #[cfg(not(unix))]
+fn open_beneath_directory(root: &Path, relative: &Path) -> std::io::Result<File> {
+    let path = root.join(relative);
+    let file = File::open(path)?;
+    if file.metadata()?.is_dir() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not a directory",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
 fn open_beneath_with_index(
     root: &Path,
     relative: &Path,
     _index_files: &[&str],
 ) -> std::io::Result<(File, PathBuf)> {
     open_beneath(root, relative)
+}
+
+/// Verify a script path with the same component-by-component no-follow
+/// boundary used for static files. The returned pathname is necessarily
+/// reopened by PHP-FPM in its own process; deployment must therefore prevent
+/// untrusted writers from renaming the document tree after this check.
+pub(crate) fn secure_script_path(root: &Path, relative: &Path) -> std::io::Result<PathBuf> {
+    let (_verified_file, path) = open_beneath_with_index(root, relative, &[])?;
+    Ok(path)
 }
 
 fn apply_custom_headers(mut resp: HttpResponse, headers: &[(String, String)]) -> HttpResponse {
@@ -483,6 +794,120 @@ fn apply_rule_headers(
             .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
     }
     resp
+}
+
+fn apply_security_headers(response: &mut HttpResponse, config: &ServerConfig) {
+    let defaults = [
+        (
+            "X-Content-Type-Options",
+            config.security_x_content_type_options.as_deref(),
+        ),
+        (
+            "Referrer-Policy",
+            config.security_referrer_policy.as_deref(),
+        ),
+        (
+            "X-Frame-Options",
+            config.security_x_frame_options.as_deref(),
+        ),
+        (
+            "Content-Security-Policy",
+            config.security_content_security_policy.as_deref(),
+        ),
+    ];
+    for (name, value) in defaults {
+        if let Some(value) = value {
+            if !response
+                .headers
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            {
+                response.headers.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+}
+
+fn remove_header(headers: &mut Vec<(String, String)>, name: &str) {
+    headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+}
+
+fn ensure_vary_accept_encoding(headers: &mut Vec<(String, String)>) {
+    if let Some((_, value)) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Vary"))
+    {
+        if !value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("Accept-Encoding"))
+        {
+            value.push_str(", Accept-Encoding");
+        }
+    } else {
+        headers.push(("Vary".to_string(), "Accept-Encoding".to_string()));
+    }
+}
+
+fn vary_etag_for_encoding(headers: &mut [(String, String)], encoding: &str) {
+    if let Some((_, value)) = headers
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("ETag"))
+    {
+        let suffix = format!("-{encoding}");
+        if let Some(stripped) = value.strip_suffix('"') {
+            *value = format!("{stripped}{suffix}\"");
+        } else {
+            value.push_str(&suffix);
+        }
+    }
+}
+
+fn accepts_gzip(value: Option<&str>) -> bool {
+    let Some(value) = value else { return false };
+    let mut wildcard = None;
+    for item in value.split(',') {
+        let mut parts = item.trim().split(';');
+        let coding = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let mut q = 1.0_f32;
+        for param in parts {
+            if let Some(raw) = param.trim().strip_prefix("q=") {
+                q = raw.parse::<f32>().unwrap_or(0.0).clamp(0.0, 1.0);
+            }
+        }
+        if coding == "gzip" {
+            return q > 0.0;
+        }
+        if coding == "*" {
+            wildcard = Some(q);
+        }
+    }
+    wildcard.is_some_and(|q| q > 0.0)
+}
+
+fn response_mime_is_compressible(resp: &HttpResponse, allowlist: &[String]) -> bool {
+    let Some(mime) = resp.headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("Content-Type")
+            .then_some(value.as_str())
+    }) else {
+        return false;
+    };
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/javascript"
+        || mime == "application/xml"
+        || mime == "image/svg+xml"
+    {
+        return true;
+    }
+    allowlist
+        .iter()
+        .any(|prefix| mime.starts_with(&prefix.to_ascii_lowercase()))
 }
 
 fn is_protected_rule_path(path: &Path) -> bool {
@@ -744,6 +1169,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gzip_accept_encoding_honors_q_values() {
+        assert!(accepts_gzip(Some("br, gzip;q=0.8")));
+        assert!(!accepts_gzip(Some("gzip;q=0")));
+        assert!(accepts_gzip(Some("*;q=0.5")));
+        assert!(!accepts_gzip(Some("identity")));
+    }
+
+    #[test]
+    fn security_headers_are_added_without_overriding_rules() {
+        let config = ServerConfig::default();
+        let manager = ConfigManager::new();
+        let handler = RequestHandler::new(&config, &manager);
+        let req = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "localhost".to_string())],
+            body: Vec::new(),
+        };
+        let response = handler.handle_request(&req, None);
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Content-Type-Options" && value == "nosniff"));
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Referrer-Policy"
+                && value == "strict-origin-when-cross-origin"));
+    }
+
+    #[test]
+    fn access_log_file_destination_fails_open_without_blocking() {
+        let path = std::env::temp_dir().join(format!("veysrs-access-{}.log", std::process::id()));
+        write_log_line(path.to_str().unwrap(), "test\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "test\n");
+        std::fs::remove_file(path).ok();
+        write_log_line("/no/such/directory/access.log", "fallback\n");
+    }
+
+    #[test]
+    fn directory_redirect_and_bounded_autoindex_use_secure_open() {
+        let root = std::env::temp_dir().join(format!("veysrs-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs/file name.txt"), b"x").unwrap();
+        fs::write(root.join(".veysrule"), b"autoindex on\n").unwrap();
+        let config = ServerConfig {
+            root_dir: root.clone(),
+            config_file: root.join(".veysrule"),
+            ..ServerConfig::default()
+        };
+        let manager = ConfigManager::new();
+        let handler = RequestHandler::new(&config, &manager);
+        let request = HttpRequest {
+            method: Method::Get,
+            uri: "/docs".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "localhost".to_string())],
+            body: Vec::new(),
+        };
+        assert_eq!(
+            handler.handle_request(&request, None).status,
+            StatusCode::MovedPermanently
+        );
+        let request = HttpRequest {
+            uri: "/docs/".to_string(),
+            ..request
+        };
+        let response = handler.handle_request(&request, None);
+        assert_eq!(response.status, StatusCode::Ok);
+        if let BodySource::Bytes(body) = response.body_source {
+            let html = String::from_utf8(body).unwrap();
+            assert!(html.contains("file%20name.txt"));
+            assert!(!html.contains(".veysrule"));
+        } else {
+            panic!("expected autoindex body");
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn test_etag_generation() {
         let etag = generate_etag(1700000000, 1024);
         assert_eq!(etag, "\"6553f100-400\"");
@@ -909,6 +1416,51 @@ mod tests {
         };
         let h1_resp = handler.handle_request(&h1_req, None);
         assert_eq!(h1_resp.status, StatusCode::NotModified);
+    }
+
+    #[test]
+    fn test_vhost_host_and_default_selection() {
+        let mut config = ServerConfig::default();
+        config.vhosts = vec![
+            crate::config::VhostConfig {
+                host: "example.test".to_string(),
+                root_dir: PathBuf::from("/tmp/example"),
+                config_file: None,
+                tls_certificate: None,
+                tls_private_key: None,
+            },
+            crate::config::VhostConfig {
+                host: "*".to_string(),
+                root_dir: PathBuf::from("/tmp/default"),
+                config_file: None,
+                tls_certificate: None,
+                tls_private_key: None,
+            },
+        ];
+        let known = HttpRequest {
+            method: Method::Get,
+            uri: "/".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "EXAMPLE.TEST:443".to_string())],
+            body: Vec::new(),
+        };
+        let unknown = HttpRequest {
+            headers: vec![("Host".to_string(), "unknown.test".to_string())],
+            ..known.clone()
+        };
+        assert_eq!(
+            select_vhost(&config, &known).unwrap().root_dir,
+            PathBuf::from("/tmp/example")
+        );
+        assert_eq!(
+            select_vhost(&config, &unknown).unwrap().root_dir,
+            PathBuf::from("/tmp/default")
+        );
+        assert_eq!(
+            normalize_host("example.test:443"),
+            Some("example.test".to_string())
+        );
+        assert_eq!(normalize_host("example.test:not-a-port"), None);
     }
 
     #[test]

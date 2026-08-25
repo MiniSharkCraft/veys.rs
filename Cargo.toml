@@ -1,6 +1,11 @@
 [package]
 name = "veysrs"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2.2"
+base64 = "0.22"
+sha1 = "0.10"
+flate2 = "1.1"

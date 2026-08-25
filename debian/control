@@ -1,0 +1,12 @@
+Source: veysrs
+Section: web
+Priority: optional
+Maintainer: VeySRS Maintainers <maintainers@example.invalid>
+Standards-Version: 4.6.0
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+
+Package: veysrs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: bounded blocking Rust HTTP/1.1 and HTTP/2 server
+ VeySRS serves static files and supports TLS, proxy, WebSocket and FastCGI.

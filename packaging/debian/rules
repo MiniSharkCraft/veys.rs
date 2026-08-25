@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/veysrs debian/veysrs/usr/bin/veysrs
+	install -D -m 0644 packaging/systemd/veysrs.service debian/veysrs/usr/lib/systemd/system/veysrs.service
